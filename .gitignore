@@ -1,0 +1,28 @@
+# --- STM32CubeIDE / Eclipse ---
+stm32_firmware/**/Debug/
+stm32_firmware/**/Release/
+stm32_firmware/**/.metadata/
+stm32_firmware/**/*.launch
+stm32_firmware/**/.settings/
+stm32_firmware/**/RTE/
+
+# --- Python (Pi vision) ---
+pi_vision/**/__pycache__/
+pi_vision/**/*.pyc
+pi_vision/**/venv/
+pi_vision/**/.venv/
+pi_vision/**/*.egg-info/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editor ---
+.vscode/
+*.swp
+
+# --- Large/binary test captures (add exceptions if needed) ---
+*.mp4
+*.mov
+!docs/**/*.mp4
