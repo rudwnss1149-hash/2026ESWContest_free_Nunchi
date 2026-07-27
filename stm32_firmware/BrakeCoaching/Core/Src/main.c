@@ -66,7 +66,7 @@ static void MX_USART3_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-int a;
+
 /* USER CODE END 0 */
 
 /**
