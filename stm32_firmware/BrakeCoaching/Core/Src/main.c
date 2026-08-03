@@ -74,6 +74,7 @@ volatile uint8_t radar_frame_ready = 0;    // 프레임 하나가 완성됐다�
 volatile float radar_distance_m = -1.0f;   // 파싱된 최신 거리값(미터), -1.0은 "아직 유효값 없음"을 의미
 volatile float radar_speed_kmh = 0.0f;     // 파싱된 최신 상대속도값(km/h), 양수=멀어짐/음수=가까워짐 (부호 규칙은 실물 확인 후 조정)
 volatile int8_t radar_angle_deg = 0;       // 파싱된 최신 각도값(도)
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -132,8 +133,15 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
+
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart1, (uint8_t*)&radar_byte, 1);  // USART1(레이더)에서도 1바이트씩 받는 인터럽트 수신을 시작(무장)
+  HAL_UART_Receive_IT(&huart1, (uint8_t*)&radar_byte, 1);  // USART1(레이더) 인터럽트 수신 시작(기존 그대로 둠)
+
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // 부저 PWM 출력 시작 (소리 나기 시작)
+
+  HAL_Delay(250);                           // 3000밀리초(3초) 동안 여기서 그냥 멈춰서 기다림 (다른 아무것도 안 하고 순수하게 대기)
+
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);   // 3초 지났으니 PWM 출력 정지 (소리 끊김)
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -143,7 +151,7 @@ int main(void)
 
       ELM327_RequestSpeed();                 // 매 반복(loop)마다 ELM327에게 속도 요청 명령을 한 번 전송
 
-      HAL_Delay(200);                        // 200밀리초 동안 프로그램을 멈춰서, 블루투스 왕복+ELM327 응답 처리시간을 기다려줌
+      HAL_Delay(67);                       // 200밀리초 동안 프로그램을 멈춰서, 블루투스 왕복+ELM327 응답 처리시간을 기다려줌
 
       if (line_ready)                        // line_ready 깃발이 1(완성됨)인지 확인하는 조건문 시작
       {                                       // if문 코드 블록 시작 중괄호
@@ -156,6 +164,9 @@ int main(void)
 
               last_speed_kmh = speed;         // 유효한 값이므로 전역변수 last_speed_kmh에 이번 속도값을 저장(갱신)
 
+              HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+              HAL_Delay(67);   // 원래 200ms 의도 → 보정값
+              HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
           }                                   // if (speed >= 0) 블록 끝
 
           line_ready = 0;                    // 이번 응답 처리를 다 끝냈으므로 깃발을 다시 0(대기 상태)으로 내림
