@@ -76,6 +76,44 @@ volatile float radar_distance_m = -1.0f;   // 파싱된 최신 거리값(미터)
 volatile float radar_speed_kmh = 0.0f;     // 파싱된 최신 상대속도값(km/h), 양수=멀어짐/음수=가까워짐 (부호 규칙은 실물 확인 후 조정)
 volatile int8_t radar_angle_deg = 0;       // 파싱된 최신 각도값(도)
 
+// ===== Pi 통신(USART2) 관련 =====
+#define PI_RX_LINE_MAX 32                  // Pi로부터 받는 한 줄의 최대 길이
+
+volatile uint8_t pi_rx_byte;               // Pi에서 인터럽트로 한 바이트씩 받을 임시 버퍼
+volatile char pi_rx_line[PI_RX_LINE_MAX];  // Pi가 보낸 한 줄을 모으는 버퍼
+volatile uint8_t pi_rx_index = 0;          // pi_rx_line에 지금 몇 번째까지 채웠는지
+volatile uint8_t pi_line_ready = 0;        // Pi로부터 한 줄 다 받았다는 신호
+
+volatile float pi_brightness_delta = 0.0f; // Pi가 보내준 밝기 델타값 (파싱 결과 저장)
+volatile uint8_t pi_anomaly_flag = 0;      // Pi가 보내준 이상여부 (0=정상, 1=이상)
+volatile uint8_t pi_data_valid = 0;        // Pi로부터 유효한 데이터를 받은 적 있는지 (아직 한 번도 못 받았으면 0)
+
+uint32_t last_pi_send_tick = 0;            // STM32가 Pi한테 마지막으로 데이터 보낸 시각(ms) 기록용
+
+// ===== 판정 로직(이상감지) 관련 =====
+#define SPEED_HISTORY_LEN 10                // 앞차 절대속도 이력을 몇 개까지 저장할지 (최근 몇 번의 측정값)
+
+typedef struct {                            // 속도 측정값 하나를 저장하는 구조체 (값+측정시각을 묶어서 관리)
+    float speed_kmh;                        // 그 시점의 앞차 절대속도
+    uint32_t tick;                          // 그 값을 측정한 시각(ms 단위, HAL_GetTick() 값)
+} SpeedSample;
+
+volatile SpeedSample front_speed_history[SPEED_HISTORY_LEN];  // 앞차 절대속도 이력을 담는 배열(원형버퍼처럼 사용)
+volatile uint8_t history_index = 0;         // 다음에 이력을 저장할 배열 위치(인덱스)
+volatile uint8_t history_count = 0;         // 지금까지 몇 개의 이력이 쌓였는지 (최대 SPEED_HISTORY_LEN)
+
+volatile float front_car_speed_kmh = 0.0f;  // 계산된 앞차 절대속도 (레이더+내차속도 결합 결과)
+
+#define DECEL_THRESHOLD_KMH 5.0f            // 이 정도(km/h) 이상 감속하면 "감속 중"으로 판단하는 기준치
+#define DECEL_WINDOW_MS 1000                // 이 시간(ms) 동안의 속도 변화를 비교해서 감속 여부 판단
+#define ANOMALY_PERSIST_MS 500              // 이상 상황이 이 시간(ms) 이상 지속돼야 최종 "이상"으로 확정
+
+volatile uint8_t is_decelerating = 0;       // 지금 앞차가 감속 중인지 여부 (0=아니오, 1=예)
+volatile uint32_t anomaly_start_tick = 0;   // "이상 의심" 상황이 시작된 시각 (지속시간 측정용)
+volatile uint8_t anomaly_confirmed = 0;     // 최종적으로 "이상"이 확정됐는지 (0.5초 지속 필터 통과 여부)
+
+#define LCD_WIDTH  240                      // 디스플레이 가로 픽셀 수
+#define LCD_HEIGHT 240                      // 디스플레이 세로 픽셀 수
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -93,6 +131,20 @@ int ParseSpeedResponse(const char *raw);   // ELM327이 보낸 응답 문자열(
                                             // 매개변수 raw: 파싱할 원본 문자열 / 반환값: 성공시 속도값(0 이상), 실패시 -1
 
 void ParseRadarFrame(void);                // 완성된 레이더 프레임을 해석해서 거리/속도/각도로 변환하는 함수 선언
+
+void Pi_SendRadarData(void);                // STM32가 Pi에게 레이더 데이터(거리, 상대속도)를 보내는 함수
+int Pi_ParseBrightnessResponse(const char *raw);  // Pi가 보낸 응답 문자열을 파싱하는 함수
+
+void UpdateFrontCarSpeed(void);             // 레이더+내차속도를 결합해서 앞차 절대속도를 계산하고 이력에 저장하는 함수
+uint8_t CheckDeceleration(void);            // 최근 이력을 보고 "지금 감속 중인지" 판정하는 함수
+void UpdateAnomalyJudgement(void);          // 감속여부+밝기이상여부를 종합해서 최종 이상감지 판정을 내리는 함수
+
+void LCD_Reset(void);                       // LCD를 하드웨어적으로 리셋시키는 함수
+void LCD_WriteCommand(uint8_t cmd);         // LCD에 "명령"을 보내는 함수
+void LCD_WriteData(uint8_t data);           // LCD에 "데이터"를 보내는 함수
+void LCD_Init(void);                        // LCD 초기화(전원 인가 후 켜지도록 설정하는) 함수
+void LCD_FillScreen(uint16_t color);        // 화면 전체를 특정 색으로 채우는 함수
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -142,6 +194,12 @@ int main(void)
   HAL_Delay(250);                           // 3000밀리초(3초) 동안 여기서 그냥 멈춰서 기다림 (다른 아무것도 안 하고 순수하게 대기)
 
   HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);   // 3초 지났으니 PWM 출력 정지 (소리 끊김)
+
+  HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2(Pi)에서도 1바이트씩 받는 인터럽트 수신 시작
+
+  LCD_Init();                                 // LCD 초기 설정 명령어들을 순서대로 전송
+  HAL_Delay(100);                             // 초기화 안정화를 위해 잠깐 대기
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -184,7 +242,25 @@ int main(void)
               radar_index = 0;                   // 다음 프레임을 처음부터 받을 수 있도록 인덱스 초기화
 
           }                                       // if (radar_frame_ready) 블록 끝
-    /* USER CODE END WHILE */
+
+      // ===== Pi와 주기적으로 데이터 주고받기 =====
+          if (HAL_GetTick() - last_pi_send_tick >= 200)          // 200ms마다 한 번씩 (레이더 데이터 갱신 주기와 맞춤)
+          {
+              Pi_SendRadarData();                                 // Pi한테 지금 레이더 값(거리, 상대속도) 전송
+              last_pi_send_tick = HAL_GetTick();                  // 마지막 전송 시각 갱신
+          }
+
+          if (pi_line_ready)                                      // Pi로부터 한 줄(응답)이 다 도착했으면
+          {
+              Pi_ParseBrightnessResponse((const char*)pi_rx_line); // 그 응답을 파싱해서 pi_brightness_delta, pi_anomaly_flag에 저장
+              pi_line_ready = 0;                                  // 처리 끝났으니 깃발 내림
+              pi_rx_index = 0;                                    // 다음 줄 받을 준비
+          }
+
+          // ===== 판정 로직 실행 =====
+          UpdateFrontCarSpeed();                                  // 레이더+내차속도로 앞차 절대속도 계산 및 이력 저장
+          UpdateAnomalyJudgement();                                // 감속여부+밝기이상여부 종합해서 최종 판정
+      /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }                                           // while(1) 루프 블록 끝 (실제로는 무한루프라 여기 도달 후 다시 맨 위로)
@@ -514,32 +590,48 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3)          // USART3(HC-05/ELM327)에서 발생한 인터럽트인 경우
     {
-        char c = (char)rx_byte;             // 받은 1바이트를 문자로 변환
-
-        if (c == '\r' || c == '>')          // 줄바꿈 또는 프롬프트 문자인지 확인
+        char c = (char)rx_byte;
+        if (c == '\r' || c == '>')
         {
-            rx_line[rx_index] = '\0';       // 문자열 끝에 널문자 추가
-            line_ready = 1;                 // 한 줄 완성 깃발 올림
+            rx_line[rx_index] = '\0';
+            line_ready = 1;
         }
-        else if (rx_index < RX_LINE_MAX - 1)  // 버퍼에 공간이 남아있으면
+        else if (rx_index < RX_LINE_MAX - 1)
         {
-            rx_line[rx_index++] = c;        // 문자 저장하고 인덱스 증가
+            rx_line[rx_index++] = c;
         }
-
-        HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);  // USART3 다음 바이트 수신 재무장
-    }                                        // USART3 처리 블록 끝
+        HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);
+    }
 
     else if (huart->Instance == USART1)      // USART1(레이더)에서 발생한 인터럽트인 경우
     {
-        radar_frame[radar_index++] = radar_byte;  // 받은 바이트를 프레임 배열에 저장하고 인덱스 증가
-
-        if (radar_index >= RADAR_FRAME_LEN)  // 정해진 프레임 길이(7바이트)만큼 다 받았는지 확인
+        radar_frame[radar_index++] = radar_byte;
+        if (radar_index >= RADAR_FRAME_LEN)
         {
-            radar_frame_ready = 1;           // 프레임 완성 깃발 올림
+            radar_frame_ready = 1;
+        }
+        HAL_UART_Receive_IT(&huart1, (uint8_t*)&radar_byte, 1);
+    }
+
+    else if (huart->Instance == USART2)      // USART2(Pi)에서 발생한 인터럽트인 경우 (새로 추가된 부분)
+    {
+        char c = (char)pi_rx_byte;           // 받은 1바이트를 문자로 변환
+
+        if (c == '\n' || c == '\r')          // 줄바꿈 문자를 만나면 (Pi는 파이썬이라 \n을 씀)
+        {
+            if (pi_rx_index > 0)             // 빈 줄이 아니라 실제로 뭔가 받은 경우에만
+            {
+                pi_rx_line[pi_rx_index] = '\0';  // 문자열 끝에 널문자 추가
+                pi_line_ready = 1;            // 한 줄 완성 깃발 올림
+            }
+        }
+        else if (pi_rx_index < PI_RX_LINE_MAX - 1)  // 버퍼에 공간 남아있으면
+        {
+            pi_rx_line[pi_rx_index++] = c;   // 문자 저장하고 인덱스 증가
         }
 
-        HAL_UART_Receive_IT(&huart1, (uint8_t*)&radar_byte, 1);  // USART1 다음 바이트 수신 재무장
-    }                                        // USART1 처리 블록 끝
+        HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2 다음 바이트 재무장
+    }
 }
 
 // 완성된 레이더 프레임(바이트 배열)을 해석해서 거리/속도/각도로 변환하는 함수
@@ -568,6 +660,302 @@ void ParseRadarFrame(void)
 }
 // UART1(레이더) 수신 콜백 — HAL_UART_RxCpltCallback은 이미 위에서 USART3용으로 만들었으므로,
 // 아래처럼 else if로 이어붙여서 하나의 콜백 함수가 USART1과 USART3를 둘 다 구분해서 처리하게 함
+
+// STM32가 Pi에게 레이더 데이터를 보내는 함수
+void Pi_SendRadarData(void)
+{
+    char msg[48];                            // 보낼 메시지를 담을 임시 문자 배열
+
+    int len = snprintf(msg, sizeof(msg), "R,%.1f,%.1f\r\n", radar_distance_m, radar_speed_kmh);
+    // "R,거리,상대속도\r\n" 형식의 문자열을 만듦, snprintf는 printf처럼 포맷팅해서 문자열로 만들어줌
+    // %.1f는 소수점 첫째자리까지 표시하라는 뜻
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 100);  // USART2로 그 문자열 전송, 타임아웃 100ms
+}
+
+// Pi가 보낸 응답("B,밝기델타,이상여부")을 파싱하는 함수
+int Pi_ParseBrightnessResponse(const char *raw)
+{
+    if (raw[0] != 'B' || raw[1] != ',')     // 응답이 "B,"로 시작하지 않으면 (형식이 다르면)
+    {
+        return -1;                           // 잘못된 형식이므로 에러 반환
+    }
+
+    float delta_val;                         // 파싱될 밝기 델타값을 담을 변수
+    int anomaly_val;                         // 파싱될 이상여부(0/1)를 담을 변수
+
+    int parsed = sscanf(raw + 2, "%f,%d", &delta_val, &anomaly_val);
+    // raw+2는 "B," 두 글자를 건너뛴 위치부터 읽기 시작한다는 뜻
+    // "%f,%d" 형식으로 부동소수점 하나, 정수 하나를 순서대로 읽어옴
+
+    if (parsed != 2)                         // 두 개 값을 다 못 읽었으면 (형식이 안 맞으면)
+    {
+        return -1;                           // 에러 반환
+    }
+
+    pi_brightness_delta = delta_val;         // 파싱 성공하면 전역변수에 밝기 델타값 저장
+    pi_anomaly_flag = (uint8_t)anomaly_val;  // 이상여부도 전역변수에 저장
+    pi_data_valid = 1;                       // "유효한 Pi 데이터를 받은 적 있다"고 표시
+
+    return 0;                                // 성공 반환
+}
+
+// 레이더의 상대속도 + 내 차 절대속도(ELM327)를 결합해서 앞차 절대속도를 계산하고 이력에 저장하는 함수
+void UpdateFrontCarSpeed(void)
+{
+    if (last_speed_kmh < 0)                  // 아직 내 차 속도값을 한 번도 못 받았으면 (-1인 초기상태)
+    {
+        return;                              // 계산 불가능하므로 그냥 함수 종료 (아무것도 안 함)
+    }
+
+    // TODO: 아래 부호 관계는 레이더 실물 데이터로 검증 후 필요시 수정
+    // radar_speed_kmh: 양수=멀어짐, 음수=가까워짐 (radar_parser.py 설계 기준)
+    front_car_speed_kmh = (float)last_speed_kmh + radar_speed_kmh;
+    // 내 차 속도에 레이더가 알려준 상대속도를 더해서 앞차의 절대속도를 역산
+
+    front_speed_history[history_index].speed_kmh = front_car_speed_kmh;  // 이번 계산값을 이력 배열에 저장
+    front_speed_history[history_index].tick = HAL_GetTick();             // 저장 시각도 같이 기록
+
+    history_index = (history_index + 1) % SPEED_HISTORY_LEN;  // 다음 저장 위치로 이동 (배열 끝에 도달하면 다시 처음으로, 원형버퍼 방식)
+
+    if (history_count < SPEED_HISTORY_LEN)   // 아직 이력이 배열 최대 크기만큼 안 쌓였으면
+    {
+        history_count++;                     // 쌓인 개수를 하나 늘림
+    }
+}
+
+// 최근 이력을 보고 "지금 앞차가 감속 중인지"를 판정하는 함수
+uint8_t CheckDeceleration(void)
+{
+    if (history_count < 2)                   // 비교할 만큼 이력이 충분히 쌓이지 않았으면
+    {
+        return 0;                            // 판단 불가, 감속 아님으로 처리
+    }
+
+    uint32_t now = HAL_GetTick();            // 현재 시각
+
+    float oldest_speed_in_window = front_car_speed_kmh;  // 비교 기준이 될 "예전 속도값", 기본값은 현재값으로 초기화
+    uint8_t found_old_sample = 0;             // 비교할 만큼 오래된 샘플을 찾았는지 표시
+
+    for (uint8_t i = 0; i < history_count; i++)  // 저장된 이력을 하나씩 순회
+    {
+        uint8_t idx = (history_index + SPEED_HISTORY_LEN - 1 - i) % SPEED_HISTORY_LEN;
+        // 제일 최근 것부터 거꾸로 순서대로 인덱스를 계산 (원형버퍼 역순 탐색)
+
+        uint32_t age_ms = now - front_speed_history[idx].tick;  // 그 샘플이 얼마나 오래된 것인지(ms)
+
+        if (age_ms >= DECEL_WINDOW_MS)       // 설정한 비교 시간창(예: 1000ms)보다 오래된 샘플을 찾으면
+        {
+            oldest_speed_in_window = front_speed_history[idx].speed_kmh;  // 그 샘플을 "예전 속도"로 채택
+            found_old_sample = 1;             // 찾았다고 표시
+            break;                            // 반복문 종료
+        }
+    }
+
+    if (!found_old_sample)                    // 시간창만큼 오래된 샘플을 못 찾았으면 (아직 데이터가 부족)
+    {
+        return 0;                            // 판단 불가, 감속 아님으로 처리
+    }
+
+    float speed_drop = oldest_speed_in_window - front_car_speed_kmh;  // 예전속도 - 현재속도 = 감속한 정도
+
+    if (speed_drop >= DECEL_THRESHOLD_KMH)    // 감속량이 기준치 이상이면
+    {
+        return 1;                             // 감속 중이라고 판정
+    }
+
+    return 0;                                 // 그 외에는 감속 아님
+}
+
+// 감속여부 + 밝기이상여부를 종합해서 최종 "제동등 이상" 판정을 내리는 함수
+void UpdateAnomalyJudgement(void)
+{
+    is_decelerating = CheckDeceleration();    // 지금 감속 중인지 판정 결과를 저장
+
+    uint8_t brake_light_missing = 0;          // "제동등이 안 켜진 것으로 보인다" 상태를 저장할 변수, 기본값 0(정상)
+
+    if (pi_data_valid)                        // Pi로부터 유효한 데이터를 받은 적 있으면
+    {
+        brake_light_missing = (pi_anomaly_flag == 0);
+        // pi_anomaly_flag가 0(정상, 즉 밝기변화 없음)이면 "제동등이 안 켜진 것"으로 해석
+        // (pi_anomaly_flag=1이면 Pi가 이미 "밝아짐" 감지했다는 뜻이므로 이 경우는 문제 없음)
+    }
+
+    if (is_decelerating && brake_light_missing)  // 감속 중인데 + 제동등은 안 켜진 것으로 보이면 (모순 상황)
+    {
+        if (anomaly_start_tick == 0)          // 이 모순 상황이 방금 막 시작된 거라면 (아직 시작시각 기록 안 됨)
+        {
+            anomaly_start_tick = HAL_GetTick();  // 지금 시각을 "이상 의심 시작 시각"으로 기록
+        }
+
+        if (HAL_GetTick() - anomaly_start_tick >= ANOMALY_PERSIST_MS)
+        // 이 모순 상황이 시작된 후로 설정한 지속시간(예: 500ms) 이상 계속됐으면
+        {
+            anomaly_confirmed = 1;            // 최종적으로 "이상"이라고 확정
+        }
+    }
+    else                                       // 감속 중이 아니거나, 제동등이 정상으로 보이면 (모순 상황 해소)
+    {
+        anomaly_start_tick = 0;               // 시작시각 초기화 (다음에 새로 감지되면 처음부터 다시 카운트)
+        anomaly_confirmed = 0;                // 이상 확정 상태도 해제
+    }
+
+    if (anomaly_confirmed)                    // 최종적으로 이상이 확정된 상태면
+    {
+        HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // 부저를 계속 울림 (경고음)
+    }
+    else                                       // 정상 상태면
+    {
+        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);   // 부저 정지
+    }
+}
+
+// LCD를 하드웨어적으로 리셋시키는 함수
+void LCD_Reset(void)
+{
+    HAL_GPIO_WritePin(LCD_RES_GPIO_Port, LCD_RES_Pin, GPIO_PIN_RESET);  // RES 핀을 LOW로 내려서 리셋 시작
+    HAL_Delay(20);                           // 20ms 대기 (리셋 신호 유지 시간)
+    HAL_GPIO_WritePin(LCD_RES_GPIO_Port, LCD_RES_Pin, GPIO_PIN_SET);    // RES 핀을 다시 HIGH로 올려서 리셋 해제
+    HAL_Delay(120);                          // 120ms 대기 (리셋 후 안정화 시간, ST7789 데이터시트 권장값)
+}
+
+// LCD에 "이건 명령이다"라고 표시하며 1바이트를 전송하는 함수
+void LCD_WriteCommand(uint8_t cmd)
+{
+    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_RESET);    // DC 핀을 LOW로 = "지금 보내는 건 명령이다"라는 신호
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET);    // CS 핀을 LOW로 = "지금부터 너(LCD)한테 말할게"라는 신호(칩 선택)
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, HAL_MAX_DELAY);                    // SPI로 명령 1바이트 전송
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);      // CS 핀을 다시 HIGH로 = "전송 끝, 이제 너한테 말 안 해"
+}
+
+// LCD에 "이건 데이터다"라고 표시하며 1바이트를 전송하는 함수
+void LCD_WriteData(uint8_t data)
+{
+    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_SET);      // DC 핀을 HIGH로 = "지금 보내는 건 데이터다"라는 신호
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET);    // CS 핀을 LOW로 (칩 선택)
+    HAL_SPI_Transmit(&hspi1, &data, 1, HAL_MAX_DELAY);                   // SPI로 데이터 1바이트 전송
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);      // CS 핀을 다시 HIGH로 (전송 끝)
+}
+
+// ST7789 LCD를 초기화하는 함수 (여러 설정 명령을 순서대로 전송)
+void LCD_Init(void)
+{
+    LCD_Reset();                             // 하드웨어 리셋 먼저 실행
+
+    LCD_WriteCommand(0x01);                  // Software Reset (소프트웨어 리셋 명령 추가)
+    HAL_Delay(150);                          // 150ms 대기 (리셋 완료 대기)
+
+    LCD_WriteCommand(0x11);                  // Sleep Out (절전모드 해제)
+    HAL_Delay(255);                          // 충분히 대기 (기존보다 늘림)
+
+    LCD_WriteCommand(0x3A);                  // Interface Pixel Format
+    LCD_WriteData(0x55);                     // 0x55 = 16비트 컬러(RGB565), 기존 0x05에서 값 수정
+                                              // (0x55는 MCU 인터페이스/RGB 인터페이스 둘 다 16비트로 지정하는 표준값)
+
+    LCD_WriteCommand(0x36);                  // Memory Data Access Control
+    LCD_WriteData(0x00);                     // 방향 기본값
+
+    LCD_WriteCommand(0xB2);                  // Porch Setting (포치 타이밍 설정, 클론 패널에서 필요한 경우 많음)
+    LCD_WriteData(0x0C);
+    LCD_WriteData(0x0C);
+    LCD_WriteData(0x00);
+    LCD_WriteData(0x33);
+    LCD_WriteData(0x33);
+
+    LCD_WriteCommand(0xB7);                  // Gate Control
+    LCD_WriteData(0x35);
+
+    LCD_WriteCommand(0xBB);                  // VCOM Setting
+    LCD_WriteData(0x19);
+
+    LCD_WriteCommand(0xC0);                  // LCM Control
+    LCD_WriteData(0x2C);
+
+    LCD_WriteCommand(0xC2);                  // VDV and VRH Command Enable
+    LCD_WriteData(0x01);
+
+    LCD_WriteCommand(0xC3);                  // VRH Set
+    LCD_WriteData(0x12);
+
+    LCD_WriteCommand(0xC4);                  // VDV Set
+    LCD_WriteData(0x20);
+
+    LCD_WriteCommand(0xC6);                  // Frame Rate Control
+    LCD_WriteData(0x0F);
+
+    LCD_WriteCommand(0xD0);                  // Power Control 1
+    LCD_WriteData(0xA4);
+    LCD_WriteData(0xA1);
+
+    LCD_WriteCommand(0xE0);                  // Positive Voltage Gamma Control
+    LCD_WriteData(0xD0);
+    LCD_WriteData(0x04);
+    LCD_WriteData(0x0D);
+    LCD_WriteData(0x11);
+    LCD_WriteData(0x13);
+    LCD_WriteData(0x2B);
+    LCD_WriteData(0x3F);
+    LCD_WriteData(0x54);
+    LCD_WriteData(0x4C);
+    LCD_WriteData(0x18);
+    LCD_WriteData(0x0D);
+    LCD_WriteData(0x0B);
+    LCD_WriteData(0x1F);
+    LCD_WriteData(0x23);
+
+    LCD_WriteCommand(0xE1);                  // Negative Voltage Gamma Control
+    LCD_WriteData(0xD0);
+    LCD_WriteData(0x04);
+    LCD_WriteData(0x0C);
+    LCD_WriteData(0x11);
+    LCD_WriteData(0x13);
+    LCD_WriteData(0x2C);
+    LCD_WriteData(0x3F);
+    LCD_WriteData(0x44);
+    LCD_WriteData(0x51);
+    LCD_WriteData(0x2F);
+    LCD_WriteData(0x1F);
+    LCD_WriteData(0x1F);
+    LCD_WriteData(0x20);
+    LCD_WriteData(0x23);
+
+    LCD_WriteCommand(0x21);                  // Display Inversion On (많은 ST7789 패널이 이거 켜야 색이 정상으로 보임)
+
+    LCD_WriteCommand(0x29);                  // Display On
+    HAL_Delay(50);
+}
+
+// 화면 전체를 지정된 색상(RGB565, 16비트)으로 채우는 함수
+void LCD_FillScreen(uint16_t color)
+{
+    LCD_WriteCommand(0x2A);                  // "Column Address Set" 명령 (가로 범위 설정 시작)
+    LCD_WriteData(0x00);                     // 시작 컬럼 상위바이트
+    LCD_WriteData(0x00);                     // 시작 컬럼 하위바이트 (0부터 시작)
+    LCD_WriteData((LCD_WIDTH - 1) >> 8);     // 끝 컬럼 상위바이트 (239를 16비트로 나눈 상위 8비트)
+    LCD_WriteData((LCD_WIDTH - 1) & 0xFF);   // 끝 컬럼 하위바이트
+
+    LCD_WriteCommand(0x2B);                  // "Row Address Set" 명령 (세로 범위 설정 시작)
+    LCD_WriteData(0x00);                     // 시작 로우 상위바이트
+    LCD_WriteData(0x00);                     // 시작 로우 하위바이트
+    LCD_WriteData((LCD_HEIGHT - 1) >> 8);    // 끝 로우 상위바이트
+    LCD_WriteData((LCD_HEIGHT - 1) & 0xFF);  // 끝 로우 하위바이트
+
+    LCD_WriteCommand(0x2C);                  // "Memory Write" 명령 (지금부터 보내는 데이터는 화면 픽셀 값이라는 뜻)
+
+    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_SET);   // DC를 HIGH로 (데이터 모드)
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET); // CS를 LOW로 (칩 선택, 이번엔 대량 전송이라 한 번만 선택)
+
+    uint8_t color_bytes[2];                  // 색상값(16비트)을 2바이트로 나눠 담을 배열
+    color_bytes[0] = color >> 8;             // 색상값의 상위 8비트
+    color_bytes[1] = color & 0xFF;           // 색상값의 하위 8비트
+
+    for (uint32_t i = 0; i < (uint32_t)LCD_WIDTH * LCD_HEIGHT; i++)  // 전체 픽셀 개수(240×240)만큼 반복
+    {
+        HAL_SPI_Transmit(&hspi1, color_bytes, 2, HAL_MAX_DELAY);    // 같은 색상 2바이트를 픽셀 하나마다 전송
+    }
+
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);  // 다 끝났으면 CS를 다시 HIGH로 (전송 종료)
+}
 
 /* USER CODE END 4 */
 
