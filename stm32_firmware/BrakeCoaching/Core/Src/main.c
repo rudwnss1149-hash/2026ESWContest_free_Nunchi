@@ -185,6 +185,7 @@ int main(void)
   HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2(Pi)에서도 1바이트씩 받는 인터럽트 수신 시작
   LCD_Init();                                 // LCD 초기 설정 명령어들을 순서대로 전송
   HAL_Delay(100);                             // 초기화 안정화를 위해 잠깐 대기
+  LCD_FillScreen(0x07E0);                     // ★진단용: 부팅 성공하면 화면이 초록색으로 채워짐 (RGB565 GREEN) — STM32가 살아있는지 눈으로 확인하는 용도
   /* USER CODE END 2 */
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
