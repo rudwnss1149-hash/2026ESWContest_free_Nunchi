@@ -57,6 +57,7 @@ volatile uint8_t rx_index = 0;             // rx_line 배열에서 지금 몇 �
 volatile uint8_t line_ready = 0;           // "한 줄이 완성됐다"는 신호를 메인 루프에 전달하는 깃발(flag) 변수, 시작값 0=아직 안 됨, 1=완성됨
 volatile int16_t last_speed_kmh = -1;      // 가장 최근에 파싱에 성공한 속도값(km/h)을 저장해두는 변수
                                             // 시작값 -1은 "아직 한 번도 유효한 값을 못 받았다"는 뜻으로 정한 특수값
+volatile uint8_t elm_data_valid = 0;       // ★추가(디버그용): ELM327 응답을 실제로 한 번이라도 정상 파싱한 적 있는지 (0=아직없음, 1=있음)
 
 // ============================================================================
 // ===== 레이더(HLK-LD2451) 수신 관련 — 실제 프로토콜 기준으로 재작성한 부분 =====
@@ -244,6 +245,7 @@ int main(void)
           if (speed >= 0) // 파싱 결과가 0 이상(=에러 아님, 유효한 값)인지 확인하는 조건문
           {  // 이 조건이 참일 때 실행될 블록 시작 중괄호
               last_speed_kmh = speed;         // 유효한 값이므로 전역변수 last_speed_kmh에 이번 속도값을 저장(갱신)
+              elm_data_valid = 1;             // ★추가(디버그용): ELM327 응답을 실제로 정상 파싱했다는 표시
           }                                   // if (speed >= 0) 블록 끝
           // (참고: ELM327 속도 수신 확인용 부저는 뺐음 — 어차피 UpdateAnomalyJudgement()가 이상 감지시 부저를 울리므로,
           //  ELM327 응답마다 매번 삑거리면 그 소리랑 겹쳐서 헷갈림. 필요하면 나중에 LED 등 다른 표시로 대체 고려)
@@ -1060,6 +1062,9 @@ static const FontGlyph FONT_TABLE[] = {
     {'K', {0b101,0b101,0b110,0b101,0b101}},
     {'M', {0b101,0b111,0b111,0b101,0b101}},
     {'H', {0b101,0b101,0b111,0b101,0b101}},
+    {'E', {0b111,0b100,0b111,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
+    {'C', {0b111,0b100,0b100,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
+    {'L', {0b100,0b100,0b100,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
 };
 #define FONT_TABLE_LEN (sizeof(FONT_TABLE) / sizeof(FONT_TABLE[0]))  // 폰트 테이블에 등록된 글리프 개수
 
@@ -1136,6 +1141,7 @@ void LCD_UpdateStatus(void)
 {
     char line1[16];    // "D:123.4M" 같은 거리/속도 정보 한 줄
     char line2[8];     // "WARN" 또는 "OK  " 경고상태 한 줄
+    char line3[16];    // ★추가(디버그용): ELM327 연결여부 + 감속판정여부 표시
 
     if (radar_distance_m < 0)                                     // 아직 유효한 레이더 타겟이 없으면
     {
@@ -1165,6 +1171,11 @@ void LCD_UpdateStatus(void)
 
     LCD_DrawString(10, 40, line1, 0xFFFF, 0x0000, 3);              // 거리/속도: 흰 글씨, 검정 배경, 3배 확대
     LCD_DrawString(10, 100, line2, warn_color, 0x0000, 6);         // 경고문구: 상태색 글씨, 검정 배경, 6배 확대(크게)
+
+    // ★추가(디버그용): ELM327 응답 받은 적 있는지(E:C=연결됨/E:L=아직없음("Lost/없음"))
+    //                  + 지금 감속판정 상태(DECEL=감속중/------ =아니오) 를 작게 표시
+    snprintf(line3, sizeof(line3), "E:%c %s", elm_data_valid ? 'C' : 'L', is_decelerating ? "DECEL" : "-----");
+    LCD_DrawString(10, 160, line3, 0xFFE0, 0x0000, 2);             // 노란 글씨, 검정 배경, 2배 확대(작게, 디버그용이니 방해 안 되게)
 }
 /* USER CODE END 4 */
 
