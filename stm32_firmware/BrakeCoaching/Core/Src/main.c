@@ -105,7 +105,7 @@ volatile uint8_t radar_debug_len = 0;                             // 지금까�
 // 인터럽트로 한 바이트씩 받는 방식은 레이더가 바이트를 빠르게 연달아 쏠 때 CPU가 못 따라가서
 // overrun(수신 놓침)이 잦았음 → DMA로 하드웨어가 알아서 계속 받아 버퍼에 채워넣게 하고,
 // 메인루프에서 여유 있을 때 그 버퍼를 읽어서 처리하는 방식으로 변경 (바이트 놓칠 위험 대폭 감소)
-#define RADAR_DMA_BUF_SIZE 512                                     // DMA 순환버퍼 크기(바이트)
+#define RADAR_DMA_BUF_SIZE 2048                                    // DMA 순환버퍼 크기(바이트) — ELM327 대기용 딜레이가 부활해서 여유있게 키움
 volatile uint8_t radar_dma_buf[RADAR_DMA_BUF_SIZE];                // DMA가 하드웨어적으로 계속 채워넣는 순환버퍼
 volatile uint16_t radar_dma_last_pos = 0;                          // 마지막으로 처리(소비)한 위치(인덱스)
 // ===== DMA 관련 추가 끝 =====
@@ -171,6 +171,9 @@ void LCD_WriteCommand(uint8_t cmd);         // LCD에 "명령"을 보내는 함�
 void LCD_WriteData(uint8_t data);           // LCD에 "데이터"를 보내는 함수
 void LCD_Init(void);                        // LCD 초기화(전원 인가 후 켜지도록 설정하는) 함수
 void LCD_FillScreen(uint16_t color);        // 화면 전체를 특정 색으로 채우는 함수
+void LCD_DrawChar(uint16_t x, uint16_t y, char c, uint16_t fg_color, uint16_t bg_color, uint8_t size);  // ★추가: 문자 하나 그리는 함수
+void LCD_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t fg_color, uint16_t bg_color, uint8_t size);  // ★추가: 문자열 그리는 함수
+void LCD_UpdateStatus(void);                // ★추가: 거리/속도/경고상태를 화면에 표시하는 함수
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -217,7 +220,7 @@ int main(void)
   HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2(Pi)에서도 1바이트씩 받는 인터럽트 수신 시작
   LCD_Init();                                 // LCD 초기 설정 명령어들을 순서대로 전송
   HAL_Delay(100);                             // 초기화 안정화를 위해 잠깐 대기
-  LCD_FillScreen(0x07E0);                     // ★진단용: 부팅 성공하면 화면이 초록색으로 채워짐 (RGB565 GREEN) — STM32가 살아있는지 눈으로 확인하는 용도
+  LCD_FillScreen(0x0000);                     // ★변경: 검증 끝났으니 진단용 초록화면 대신 검정 배경으로 시작 (이제 그 위에 거리/속도/경고 텍스트를 그림)
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -225,9 +228,15 @@ int main(void)
   while (1)                                  // 전원이 켜져있는 동안 무한히 반복되는 메인 루프의 시작
   {                                           // while 루프의 코드 블록 시작 중괄호
       RadarProcessDmaBuffer();               // ★추가: DMA 순환버퍼에 새로 들어온 레이더 바이트들을 매 루프마다 즉시 처리 (버퍼 넘치기 전에 자주 불러줘야 함)
-      // ===== 레이더 단독 테스트 중: ELM327 요청을 끄면 부저가 레이더 신호에만 반응함 =====
-      // ELM327_RequestSpeed();                 // ★테스트중 비활성화: 매 반복마다 ELM327에게 속도 요청 명령 전송 (부저 안 울리게 끔)
-      // HAL_Delay(67);                       // ★테스트중 비활성화: ELM327 응답 대기용 딜레이였는데, 레이더 DMA버퍼를 자주 비워줘야 해서 지금은 꺼둠 (ELM327 다시 켤 때 같이 복구)
+      ELM327_RequestSpeed();                 // ★복구: 매 반복마다 ELM327에게 "지금 속도 알려줘" 명령 전송 (내 차 절대속도 요청)
+      // ★참고: 예전 코드는 "HAL_Delay(67); // 200ms 의도"였는데, 그때는 클럭이 실제로는 3배 느리게 돌고 있어서
+      // 67ms를 실행하면 실제로는 약 200ms가 흘렀던 것 (67 × 3.125 ≈ 209ms). 즉 클럭 버그를 역이용해 값을 줄여서 보정해뒀던 것.
+      // 이제 클럭이 정확해졌으니 그 보정이 필요 없음 → 진짜 200ms(=10ms×20)로 되돌림
+      for (uint8_t _w = 0; _w < 20; _w++)    // 10ms씩 20번(총 200ms) 나눠서 기다리며 (블루투스 왕복+ELM327 응답 처리시간 확보)
+      {
+          HAL_Delay(10);                       // 10ms 대기
+          RadarProcessDmaBuffer();             // 그 사이사이 레이더 DMA버퍼도 계속 비워줌 (안 그러면 200ms 동안 못 비워서 놓칠 수 있음)
+      }
       if (line_ready)                        // line_ready 깃발이 1(완성됨)인지 확인하는 조건문 시작
       {                                       // if문 코드 블록 시작 중괄호
           int speed = ParseSpeedResponse((const char*)rx_line);
@@ -235,11 +244,9 @@ int main(void)
           if (speed >= 0) // 파싱 결과가 0 이상(=에러 아님, 유효한 값)인지 확인하는 조건문
           {  // 이 조건이 참일 때 실행될 블록 시작 중괄호
               last_speed_kmh = speed;         // 유효한 값이므로 전역변수 last_speed_kmh에 이번 속도값을 저장(갱신)
-              // ★테스트중 비활성화: ELM327 속도 수신시 울리던 부저 (레이더 테스트와 소리 겹치지 않게)
-              // HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-              // HAL_Delay(67);   // 원래 200ms 의도 → 보정값
-              // HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
           }                                   // if (speed >= 0) 블록 끝
+          // (참고: ELM327 속도 수신 확인용 부저는 뺐음 — 어차피 UpdateAnomalyJudgement()가 이상 감지시 부저를 울리므로,
+          //  ELM327 응답마다 매번 삑거리면 그 소리랑 겹쳐서 헷갈림. 필요하면 나중에 LED 등 다른 표시로 대체 고려)
           line_ready = 0;                    // 이번 응답 처리를 다 끝냈으므로 깃발을 다시 0(대기 상태)으로 내림
           rx_index = 0;                      // 다음 번 응답을 처음 칸부터 새로 채울 수 있도록 인덱스를 0으로 초기화
       }                                       // if (line_ready) 블록 끝
@@ -257,68 +264,25 @@ int main(void)
           }
           if (pi_line_ready)                                      // Pi로부터 한 줄(응답)이 다 도착했으면
           {
-              Pi_ParseBrightnessResponse((const char*)pi_rx_line); // 그 응답을 파싱해서 pi_brightness_delta, pi_anomaly_flag에 저장
+              Pi_ParseBrightnessResponse((const char*)pi_rx_line); // 그 응답을 파싱해서 pi_brightness_delta, pi_anomaly_flag에 저장 (★검증 끝: STM32<->Pi B, 파싱 정상 확인됨)
               pi_line_ready = 0;                                  // 처리 끝났으니 깃발 내림
               pi_rx_index = 0;                                    // 다음 줄 받을 준비
           }
           // ===== 판정 로직 실행 =====
-          // ★테스트중 비활성화: UpdateAnomalyJudgement() 내부에서도 부저를 건드리기 때문에
-          // 레이더 파싱 테스트용 부저 소리랑 겹치지 않게 둘 다 잠깐 꺼둠. 테스트 끝나면 다시 주석 풀 것
-          // UpdateFrontCarSpeed();                                  // 레이더+내차속도로 앞차 절대속도 계산 및 이력 저장
-          // UpdateAnomalyJudgement();                                // 감속여부+밝기이상여부 종합해서 최종 판정
+          UpdateFrontCarSpeed();                                  // ★복구: 레이더+내차속도로 앞차 절대속도 계산 및 이력 저장
+          UpdateAnomalyJudgement();                                // ★복구: 감속여부+밝기이상여부 종합해서 최종 판정 (이상 감지시 부저 울림)
 
-          // ===== raw byte 감지(웅- 소리)는 이제 다시 끔: 빌드/업로드/배선 다 확인됐으니까 =====
-          /*
+          // ===== ★추가: 디스플레이에 거리/속도/경고상태 표시 =====
           {
-              static uint32_t last_raw_count = 0;
-              static uint32_t last_change_tick = 0;
-              uint32_t now_count = radar_raw_byte_count;
-              if (now_count != last_raw_count)
+              static uint32_t last_lcd_update_tick = 0;             // 마지막으로 화면 갱신한 시각(ms)
+              if (HAL_GetTick() - last_lcd_update_tick >= 300)        // 300ms마다 한 번씩 갱신 (너무 자주 그리면 SPI 부하만 커짐)
               {
-                  last_raw_count = now_count;
-                  last_change_tick = HAL_GetTick();
-                  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-              }
-              else if (HAL_GetTick() - last_change_tick > 300)
-              {
-                  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+                  LCD_UpdateStatus();                                   // 거리/속도/경고문구를 화면에 그림
+                  last_lcd_update_tick = HAL_GetTick();
               }
           }
-          */
-          // ===== 진단용 로직 끝 =====
+          // ===== 디스플레이 갱신 끝 =====
 
-          // ===== ★진단용: STM32가 USART1(레이더)에서 실제로 받은 raw 바이트를 Pi로 중계해서 보여줌 =====
-          // Pi에서 radar_debug_read.py 돌려놓으면 "RAW: F4 F3 F2 F1 ..." 이런 줄이 찍힘
-          // → 이걸 CH340으로 PC에서 직접 본 값이랑 비교하면, STM32가 진짜로 똑같은 바이트를 받는지 확인 가능
-          {
-              static uint32_t last_debug_send_tick = 0;             // 마지막으로 디버그 데이터를 보낸 시각(ms)
-              if (HAL_GetTick() - last_debug_send_tick >= 300)        // 300ms마다 한 번씩
-              {
-                  __disable_irq();                                     // 버퍼를 복사하는 동안 인터럽트가 끼어들지 못하게 잠깐 막음
-                  uint8_t snapshot_len = radar_debug_len;                // 지금까지 쌓인 바이트 개수를 복사
-                  uint8_t snapshot_buf[RADAR_DEBUG_BUF_LEN];             // 복사해둘 임시 버퍼
-                  for (uint8_t i = 0; i < snapshot_len; i++)             // 쌓여있던 바이트들을 하나씩 복사
-                  {
-                      snapshot_buf[i] = radar_debug_buf[i];
-                  }
-                  radar_debug_len = 0;                                   // 원본 버퍼는 비움(다음 300ms 동안 다시 쌓이게)
-                  __enable_irq();                                        // 인터럽트 다시 허용
-
-                  if (snapshot_len > 0)                                  // 뭔가 쌓인 게 있었으면
-                  {
-                      char dbg_msg[3 + RADAR_DEBUG_BUF_LEN * 3 + 3];       // "RAW:" + (바이트당 "XX ") + 개행
-                      int pos = snprintf(dbg_msg, sizeof(dbg_msg), "RAW:"); // 맨 앞에 "RAW:" 태그 붙임(다른 메시지랑 구분용)
-                      for (uint8_t i = 0; i < snapshot_len; i++)             // 바이트 하나씩 2자리 16진수 텍스트로 변환
-                      {
-                          pos += snprintf(dbg_msg + pos, sizeof(dbg_msg) - pos, "%02X ", snapshot_buf[i]);
-                      }
-                      pos += snprintf(dbg_msg + pos, sizeof(dbg_msg) - pos, "\r\n"); // 줄 끝에 개행 추가
-                      HAL_UART_Transmit(&huart2, (uint8_t*)dbg_msg, pos, 100);        // Pi한테 USART2로 전송
-                  }
-                  last_debug_send_tick = HAL_GetTick();                  // 마지막 전송 시각 갱신
-              }
-          }
-          // ===== raw 바이트 중계 끝 =====
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -466,7 +430,7 @@ static void MX_USART1_UART_Init(void)
   /* USER CODE BEGIN USART1_Init 1 */
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 115200;           // ★변경: .ioc 재생성 과정에서 9600으로 되돌아갔던 것을 다시 115200으로 수정함 (HLK-LD2451 실제 baudrate)
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -819,13 +783,7 @@ void ParseRadarFrame(void)
     radar_angle_deg  = (int8_t)angle_raw;                       // 각도 저장
 
     (void)alarm_info; (void)snr;                                // 아직 안 쓰는 값들이라 컴파일 경고 방지용으로 캐스팅
-
-    // ===== 레이더 테스트 전용: 프레임 파싱 성공하면 부저 짧게 삑 =====
-    // ★검증 끝나면 아래 3줄 삭제할 것 (원래 이 위치엔 아무 소리도 없었음)
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);   // 부저 켜기 (PC6, TIM3_CH1)
-    HAL_Delay(50);                               // 50ms만 짧게 울림
-    HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);     // 부저 끄기
-    // ===== 테스트 코드 끝 =====
+    // ★제거: 프레임 파싱 성공시 삑거리던 테스트용 부저 삭제함 (검증 끝났고, UpdateAnomalyJudgement()가 실제 이상감지 부저를 담당하므로 여기서 건드리면 소리가 겹침)
 }
 // STM32가 Pi에게 레이더 데이터를 보내는 함수
 void Pi_SendRadarData(void)
@@ -1064,6 +1022,149 @@ void LCD_FillScreen(uint16_t color)
         HAL_SPI_Transmit(&hspi1, color_bytes, 2, HAL_MAX_DELAY);    // 같은 색상 2바이트를 픽셀 하나마다 전송
     }
     HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);  // 다 끝났으면 CS를 다시 HIGH로 (전송 종료)
+}
+
+// ============================================================================
+// ===== ★추가: 간단한 3x5 비트맵 폰트로 글자/숫자 그리기 =====
+// 필요한 문자만 최소한으로 넣어둠: 숫자 0~9, '-' '.' ':' 공백, 그리고 D S W A R N O K M H
+// (표시할 문구가 "D:12.3M S:-4" "WARN"/"OK" 정도라서 이 문자들만 있으면 충분함)
+// 각 문자는 5행 x 3열 크기, rows[]의 각 바이트 하위 3비트가 그 행의 픽셀 패턴 (왼쪽부터 bit2,bit1,bit0)
+// ============================================================================
+typedef struct {
+    char ch;             // 이 글리프가 어떤 문자를 나타내는지
+    uint8_t rows[5];      // 5개 행의 비트패턴 (각 0~0b111)
+} FontGlyph;
+
+static const FontGlyph FONT_TABLE[] = {
+    {'0', {0b111,0b101,0b101,0b101,0b111}},
+    {'1', {0b010,0b110,0b010,0b010,0b111}},
+    {'2', {0b111,0b001,0b111,0b100,0b111}},
+    {'3', {0b111,0b001,0b111,0b001,0b111}},
+    {'4', {0b101,0b101,0b111,0b001,0b001}},
+    {'5', {0b111,0b100,0b111,0b001,0b111}},
+    {'6', {0b111,0b100,0b111,0b101,0b111}},
+    {'7', {0b111,0b001,0b001,0b001,0b001}},
+    {'8', {0b111,0b101,0b111,0b101,0b111}},
+    {'9', {0b111,0b101,0b111,0b001,0b111}},
+    {'-', {0b000,0b000,0b111,0b000,0b000}},
+    {'.', {0b000,0b000,0b000,0b000,0b010}},
+    {':', {0b000,0b010,0b000,0b010,0b000}},
+    {' ', {0b000,0b000,0b000,0b000,0b000}},
+    {'D', {0b110,0b101,0b101,0b101,0b110}},
+    {'S', {0b111,0b100,0b111,0b001,0b111}},
+    {'W', {0b101,0b101,0b101,0b111,0b101}},
+    {'A', {0b010,0b101,0b111,0b101,0b101}},
+    {'R', {0b110,0b101,0b110,0b101,0b101}},
+    {'N', {0b101,0b111,0b111,0b111,0b101}},
+    {'O', {0b111,0b101,0b101,0b101,0b111}},
+    {'K', {0b101,0b101,0b110,0b101,0b101}},
+    {'M', {0b101,0b111,0b111,0b101,0b101}},
+    {'H', {0b101,0b101,0b111,0b101,0b101}},
+};
+#define FONT_TABLE_LEN (sizeof(FONT_TABLE) / sizeof(FONT_TABLE[0]))  // 폰트 테이블에 등록된 글리프 개수
+
+// 문자 하나에 해당하는 비트패턴(5바이트)을 찾아 반환, 못 찾으면 NULL(=공백으로 취급)
+static const uint8_t* FindGlyph(char c)
+{
+    for (uint8_t i = 0; i < FONT_TABLE_LEN; i++)     // 폰트 테이블을 처음부터 순서대로 검사
+    {
+        if (FONT_TABLE[i].ch == c)                     // 찾는 문자와 일치하면
+        {
+            return FONT_TABLE[i].rows;                   // 그 글리프의 비트패턴 5바이트를 반환
+        }
+    }
+    return NULL;                                       // 등록 안 된 문자면 NULL (공백처럼 그려짐)
+}
+
+// 문자 하나를 (x,y) 위치(왼쪽위 기준)에 그리는 함수. size는 확대배율 (1이면 3x5픽셀, 4면 12x20픽셀)
+void LCD_DrawChar(uint16_t x, uint16_t y, char c, uint16_t fg_color, uint16_t bg_color, uint8_t size)
+{
+    const uint8_t *glyph = FindGlyph(c);      // 이 문자의 비트패턴 찾기 (없으면 NULL=빈칸)
+    uint16_t w = 3 * size;                    // 이 문자가 화면에서 차지할 가로 픽셀 수
+    uint16_t h = 5 * size;                    // 이 문자가 화면에서 차지할 세로 픽셀 수
+
+    LCD_WriteCommand(0x2A);                   // Column Address Set: 이 문자가 그려질 가로범위 지정
+    LCD_WriteData(x >> 8);
+    LCD_WriteData(x & 0xFF);
+    LCD_WriteData((x + w - 1) >> 8);
+    LCD_WriteData((x + w - 1) & 0xFF);
+    LCD_WriteCommand(0x2B);                   // Row Address Set: 이 문자가 그려질 세로범위 지정
+    LCD_WriteData(y >> 8);
+    LCD_WriteData(y & 0xFF);
+    LCD_WriteData((y + h - 1) >> 8);
+    LCD_WriteData((y + h - 1) & 0xFF);
+    LCD_WriteCommand(0x2C);                   // Memory Write: 지금부터 픽셀 데이터 전송 시작
+
+    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_SET);    // DC HIGH = 데이터 모드
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET);  // CS LOW = 칩 선택 (문자 하나 다 그릴 때까지 유지)
+
+    uint8_t fg_bytes[2] = { (uint8_t)(fg_color >> 8), (uint8_t)(fg_color & 0xFF) };  // 글자색 RGB565를 2바이트로
+    uint8_t bg_bytes[2] = { (uint8_t)(bg_color >> 8), (uint8_t)(bg_color & 0xFF) };  // 배경색 RGB565를 2바이트로
+
+    for (uint8_t row = 0; row < 5; row++)                    // 폰트의 5개 행을 위에서 아래로
+    {
+        uint8_t bits = glyph ? glyph[row] : 0;                  // 이 행의 3비트 패턴 (glyph가 NULL이면 전부 꺼짐=공백)
+        for (uint8_t ry = 0; ry < size; ry++)                   // 세로로 size배 확대해서 반복
+        {
+            for (uint8_t col = 0; col < 3; col++)                 // 폰트의 3개 열을 왼쪽부터
+            {
+                uint8_t on = (bits >> (2 - col)) & 0x01;            // 그 칸이 켜져있는지(1) 꺼져있는지(0)
+                for (uint8_t rx = 0; rx < size; rx++)                 // 가로로 size배 확대해서 반복
+                {
+                    HAL_SPI_Transmit(&hspi1, on ? fg_bytes : bg_bytes, 2, HAL_MAX_DELAY);  // 켜진 칸이면 글자색, 꺼진 칸이면 배경색으로 픽셀 전송
+                }
+            }
+        }
+    }
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);    // 문자 다 그렸으면 CS 다시 HIGH로
+}
+
+// 문자열을 (x,y)부터 가로로 이어서 그리는 함수
+void LCD_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t fg_color, uint16_t bg_color, uint8_t size)
+{
+    uint16_t cursor_x = x;                        // 지금 그릴 위치(가로), 처음엔 시작 x좌표
+    while (*str)                                  // 문자열 끝(널문자)에 도달할 때까지 반복
+    {
+        LCD_DrawChar(cursor_x, y, *str, fg_color, bg_color, size);  // 현재 위치에 문자 하나 그리기
+        cursor_x += (3 * size) + size;               // 다음 문자 위치로 이동 (문자폭 + 글자사이 여백 1칸)
+        str++;                                       // 다음 문자로
+    }
+}
+
+// ★추가: 지금까지 계산된 거리/속도/경고상태를 화면에 표시하는 함수 (메인루프에서 300ms마다 호출됨)
+void LCD_UpdateStatus(void)
+{
+    char line1[16];    // "D:123.4M" 같은 거리/속도 정보 한 줄
+    char line2[8];     // "WARN" 또는 "OK  " 경고상태 한 줄
+
+    if (radar_distance_m < 0)                                     // 아직 유효한 레이더 타겟이 없으면
+    {
+        snprintf(line1, sizeof(line1), "D:---  S:----");            // 값 대신 "---"로 표시
+    }
+    else                                                          // 유효한 타겟이 있으면
+    {
+        int dist_int  = (int)radar_distance_m;                       // 거리의 정수부
+        int dist_frac = (int)((radar_distance_m - dist_int) * 10);   // 거리의 소수 첫째자리 (float printf 없이 직접 계산)
+        if (dist_frac < 0) dist_frac = -dist_frac;                   // 혹시 음수 반올림 오차 나오면 절대값 처리
+        int speed_int = (int)radar_speed_kmh;                        // 속도는 소수점 없이 정수로만 표시
+        snprintf(line1, sizeof(line1), "D:%3d.%1dM S:%4d", dist_int, dist_frac, speed_int);
+        // %3d, %4d로 자리수를 고정해서, 이전에 더 길게 그렸던 숫자의 잔상이 안 남게 함
+    }
+
+    uint16_t warn_color;                                          // 경고 문구 색상 (상태에 따라 초록/빨강)
+    if (anomaly_confirmed)                                        // 최종 이상 확정 상태면
+    {
+        snprintf(line2, sizeof(line2), "WARN");
+        warn_color = 0xF800;                                        // 빨강 (RGB565)
+    }
+    else                                                          // 정상 상태면
+    {
+        snprintf(line2, sizeof(line2), "OK  ");                     // "OK"도 4글자로 맞춰서 잔상 방지
+        warn_color = 0x07E0;                                        // 초록 (RGB565)
+    }
+
+    LCD_DrawString(10, 40, line1, 0xFFFF, 0x0000, 3);              // 거리/속도: 흰 글씨, 검정 배경, 3배 확대
+    LCD_DrawString(10, 100, line2, warn_color, 0x0000, 6);         // 경고문구: 상태색 글씨, 검정 배경, 6배 확대(크게)
 }
 /* USER CODE END 4 */
 
