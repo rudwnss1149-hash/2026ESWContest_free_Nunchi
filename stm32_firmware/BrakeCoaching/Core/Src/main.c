@@ -18,26 +18,35 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
+
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 /* USER CODE END PTD */
+
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* USER CODE END PD */
+
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 /* USER CODE END PM */
+
 /* Private variables ---------------------------------------------------------*/
 SPI_HandleTypeDef hspi1;
+
 TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart1_rx;
+
 /* USER CODE BEGIN PV */
 #define RX_LINE_MAX 32                     // 한 줄(응답) 버퍼의 최대 길이를 32바이트로 정의하는 매크로 상수
 volatile uint8_t rx_byte;                  // 인터럽트로 한 바이트씩 새로 받아올 때 임시로 담아두는 1바이트짜리 변수
@@ -82,7 +91,7 @@ volatile uint16_t radar_payload_len  = 0;                  // 길이필드에서
 volatile uint8_t  radar_payload_idx  = 0;                  // 페이로드를 지금 몇 바이트째 받는 중인지
 volatile uint8_t  radar_tail_idx     = 0;                  // 테일을 지금 몇 바이트째 확인 중인지
 volatile uint8_t  radar_payload_buf[RADAR_MAX_PAYLOAD];    // 페이로드만 따로 모아 담는 버퍼
-volatile uint8_t  radar_byte;                              // 인터럽트로 한 바이트씩 받아올 임시 변수
+volatile uint8_t  radar_byte;                              // (더 이상 사용 안 함: DMA 방식으로 바뀌면서 미사용, 호환성 위해 남겨둠)
 volatile uint8_t  radar_frame_ready = 0;                   // 프레임 하나가 완전히(헤더+길이+페이로드+테일 검증) 도착했다는 신호
 volatile uint32_t radar_raw_byte_count = 0;                 // ★진단용: 프로토콜 해석과 무관하게, USART1로 바이트가 "몇 개나 도착했는지"만 세는 카운터
 
@@ -91,6 +100,15 @@ volatile uint32_t radar_raw_byte_count = 0;                 // ★진단용: 프
 #define RADAR_DEBUG_BUF_LEN 64                                    // 한 번에 최대 몇 바이트까지 모아서 보낼지
 volatile uint8_t radar_debug_buf[RADAR_DEBUG_BUF_LEN];            // raw 바이트를 그대로 쌓아두는 버퍼
 volatile uint8_t radar_debug_len = 0;                             // 지금까지 몇 바이트나 쌓였는지
+
+// ===== ★추가: 레이더 DMA 순환수신 관련 =====
+// 인터럽트로 한 바이트씩 받는 방식은 레이더가 바이트를 빠르게 연달아 쏠 때 CPU가 못 따라가서
+// overrun(수신 놓침)이 잦았음 → DMA로 하드웨어가 알아서 계속 받아 버퍼에 채워넣게 하고,
+// 메인루프에서 여유 있을 때 그 버퍼를 읽어서 처리하는 방식으로 변경 (바이트 놓칠 위험 대폭 감소)
+#define RADAR_DMA_BUF_SIZE 512                                     // DMA 순환버퍼 크기(바이트)
+volatile uint8_t radar_dma_buf[RADAR_DMA_BUF_SIZE];                // DMA가 하드웨어적으로 계속 채워넣는 순환버퍼
+volatile uint16_t radar_dma_last_pos = 0;                          // 마지막으로 처리(소비)한 위치(인덱스)
+// ===== DMA 관련 추가 끝 =====
 
 volatile float radar_distance_m  = -1.0f;   // 파싱된 최신 거리값(m), -1.0=유효값 없음
 volatile float radar_speed_kmh   = 0.0f;    // 파싱된 최신 상대속도값(km/h), 양수=멀어짐/음수=가까워짐
@@ -126,9 +144,11 @@ volatile uint8_t anomaly_confirmed = 0;     // 최종적으로 "이상"이 확�
 #define LCD_WIDTH  240                      // 디스플레이 가로 픽셀 수
 #define LCD_HEIGHT 240                      // 디스플레이 세로 픽셀 수
 /* USER CODE END PV */
+
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
@@ -139,6 +159,8 @@ void ELM327_RequestSpeed(void);            // ELM327에게 "지금 속도 알려
 int ParseSpeedResponse(const char *raw);   // ELM327이 보낸 응답 문자열(raw)을 받아서 정수 속도값으로 바꿔주는 함수의 선언(원형)
                                             // 매개변수 raw: 파싱할 원본 문자열 / 반환값: 성공시 속도값(0 이상), 실패시 -1
 void ParseRadarFrame(void);                // 완성된 레이더 프레임을 해석해서 거리/속도/각도로 변환하는 함수 선언
+void RadarProcessByte(uint8_t b);          // ★추가: 레이더 바이트 하나를 상태기계에 넣어 처리하는 함수 선언 (DMA버퍼 처리용)
+void RadarProcessDmaBuffer(void);          // ★추가: DMA 순환버퍼에 새로 쌓인 바이트들을 꺼내 처리하는 함수 선언
 void Pi_SendRadarData(void);                // STM32가 Pi에게 레이더 데이터(거리, 상대속도)를 보내는 함수
 int Pi_ParseBrightnessResponse(const char *raw);  // Pi가 보낸 응답 문자열을 파싱하는 함수
 void UpdateFrontCarSpeed(void);             // 레이더+내차속도를 결합해서 앞차 절대속도를 계산하고 이력에 저장하는 함수
@@ -150,35 +172,45 @@ void LCD_WriteData(uint8_t data);           // LCD에 "데이터"를 보내는 �
 void LCD_Init(void);                        // LCD 초기화(전원 인가 후 켜지도록 설정하는) 함수
 void LCD_FillScreen(uint16_t color);        // 화면 전체를 특정 색으로 채우는 함수
 /* USER CODE END PFP */
+
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 /* USER CODE END 0 */
+
 /**
   * @brief  The application entry point.
   * @retval int
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
   /* USER CODE END 1 */
+
   /* MCU Configuration--------------------------------------------------------*/
+
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+
   /* USER CODE BEGIN Init */
   /* USER CODE END Init */
+
   /* Configure the system clock */
   SystemClock_Config();
+
   /* USER CODE BEGIN SysInit */
   /* USER CODE END SysInit */
+
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_SPI1_Init();
   MX_TIM3_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart1, (uint8_t*)&radar_byte, 1);  // USART1(레이더) 인터럽트 수신 시작(기존 그대로 둠)
+  HAL_UART_Receive_DMA(&huart1, (uint8_t*)radar_dma_buf, RADAR_DMA_BUF_SIZE);  // ★변경: USART1(레이더) DMA 순환수신 시작 (기존 인터럽트 방식 → DMA로 교체, overrun 문제 해결용)
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // 부저 PWM 출력 시작 (소리 나기 시작)
   HAL_Delay(250);                           // 3000밀리초(3초) 동안 여기서 그냥 멈춰서 기다림 (다른 아무것도 안 하고 순수하게 대기)
   HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);   // 3초 지났으니 PWM 출력 정지 (소리 끊김)
@@ -187,13 +219,15 @@ int main(void)
   HAL_Delay(100);                             // 초기화 안정화를 위해 잠깐 대기
   LCD_FillScreen(0x07E0);                     // ★진단용: 부팅 성공하면 화면이 초록색으로 채워짐 (RGB565 GREEN) — STM32가 살아있는지 눈으로 확인하는 용도
   /* USER CODE END 2 */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)                                  // 전원이 켜져있는 동안 무한히 반복되는 메인 루프의 시작
   {                                           // while 루프의 코드 블록 시작 중괄호
+      RadarProcessDmaBuffer();               // ★추가: DMA 순환버퍼에 새로 들어온 레이더 바이트들을 매 루프마다 즉시 처리 (버퍼 넘치기 전에 자주 불러줘야 함)
       // ===== 레이더 단독 테스트 중: ELM327 요청을 끄면 부저가 레이더 신호에만 반응함 =====
       // ELM327_RequestSpeed();                 // ★테스트중 비활성화: 매 반복마다 ELM327에게 속도 요청 명령 전송 (부저 안 울리게 끔)
-      HAL_Delay(67);                       // 200밀리초 동안 프로그램을 멈춰서, 블루투스 왕복+ELM327 응답 처리시간을 기다려줌
+      // HAL_Delay(67);                       // ★테스트중 비활성화: ELM327 응답 대기용 딜레이였는데, 레이더 DMA버퍼를 자주 비워줘야 해서 지금은 꺼둠 (ELM327 다시 켤 때 같이 복구)
       if (line_ready)                        // line_ready 깃발이 1(완성됨)인지 확인하는 조건문 시작
       {                                       // if문 코드 블록 시작 중괄호
           int speed = ParseSpeedResponse((const char*)rx_line);
@@ -260,7 +294,7 @@ int main(void)
               static uint32_t last_debug_send_tick = 0;             // 마지막으로 디버그 데이터를 보낸 시각(ms)
               if (HAL_GetTick() - last_debug_send_tick >= 300)        // 300ms마다 한 번씩
               {
-                  __disable_irq();                                     // 버퍼를 복사하는 동안 인터럽트(USART1 수신)가 끼어들지 못하게 잠깐 막음
+                  __disable_irq();                                     // 버퍼를 복사하는 동안 인터럽트가 끼어들지 못하게 잠깐 막음
                   uint8_t snapshot_len = radar_debug_len;                // 지금까지 쌓인 바이트 개수를 복사
                   uint8_t snapshot_buf[RADAR_DEBUG_BUF_LEN];             // 복사해둘 임시 버퍼
                   for (uint8_t i = 0; i < snapshot_len; i++)             // 쌓여있던 바이트들을 하나씩 복사
@@ -285,11 +319,13 @@ int main(void)
               }
           }
           // ===== raw 바이트 중계 끝 =====
-      /* USER CODE END WHILE */
+    /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
   }                                           // while(1) 루프 블록 끝 (실제로는 무한루프라 여기 도달 후 다시 맨 위로)
   /* USER CODE END 3 */
 }
+
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -298,10 +334,12 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
@@ -309,14 +347,15 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 25;
-  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 168;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
   }
+
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
@@ -325,11 +364,13 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
   {
     Error_Handler();
   }
 }
+
 /**
   * @brief SPI1 Initialization Function
   * @param None
@@ -337,8 +378,10 @@ void SystemClock_Config(void)
   */
 static void MX_SPI1_Init(void)
 {
+
   /* USER CODE BEGIN SPI1_Init 0 */
   /* USER CODE END SPI1_Init 0 */
+
   /* USER CODE BEGIN SPI1_Init 1 */
   /* USER CODE END SPI1_Init 1 */
   /* SPI1 parameter configuration*/
@@ -360,7 +403,9 @@ static void MX_SPI1_Init(void)
   }
   /* USER CODE BEGIN SPI1_Init 2 */
   /* USER CODE END SPI1_Init 2 */
+
 }
+
 /**
   * @brief TIM3 Initialization Function
   * @param None
@@ -368,10 +413,13 @@ static void MX_SPI1_Init(void)
   */
 static void MX_TIM3_Init(void)
 {
+
   /* USER CODE BEGIN TIM3_Init 0 */
   /* USER CODE END TIM3_Init 0 */
+
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
+
   /* USER CODE BEGIN TIM3_Init 1 */
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
@@ -401,7 +449,9 @@ static void MX_TIM3_Init(void)
   /* USER CODE BEGIN TIM3_Init 2 */
   /* USER CODE END TIM3_Init 2 */
   HAL_TIM_MspPostInit(&htim3);
+
 }
+
 /**
   * @brief USART1 Initialization Function
   * @param None
@@ -409,12 +459,14 @@ static void MX_TIM3_Init(void)
   */
 static void MX_USART1_UART_Init(void)
 {
+
   /* USER CODE BEGIN USART1_Init 0 */
   /* USER CODE END USART1_Init 0 */
+
   /* USER CODE BEGIN USART1_Init 1 */
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;           // ★변경: 기존 9600 → 115200 (HLK-LD2451 실제 기본 baudrate)
+  huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -427,7 +479,9 @@ static void MX_USART1_UART_Init(void)
   }
   /* USER CODE BEGIN USART1_Init 2 */
   /* USER CODE END USART1_Init 2 */
+
 }
+
 /**
   * @brief USART2 Initialization Function
   * @param None
@@ -435,8 +489,10 @@ static void MX_USART1_UART_Init(void)
   */
 static void MX_USART2_UART_Init(void)
 {
+
   /* USER CODE BEGIN USART2_Init 0 */
   /* USER CODE END USART2_Init 0 */
+
   /* USER CODE BEGIN USART2_Init 1 */
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
@@ -453,7 +509,9 @@ static void MX_USART2_UART_Init(void)
   }
   /* USER CODE BEGIN USART2_Init 2 */
   /* USER CODE END USART2_Init 2 */
+
 }
+
 /**
   * @brief USART3 Initialization Function
   * @param None
@@ -461,8 +519,10 @@ static void MX_USART2_UART_Init(void)
   */
 static void MX_USART3_UART_Init(void)
 {
+
   /* USER CODE BEGIN USART3_Init 0 */
   /* USER CODE END USART3_Init 0 */
+
   /* USER CODE BEGIN USART3_Init 1 */
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
@@ -479,7 +539,25 @@ static void MX_USART3_UART_Init(void)
   }
   /* USER CODE BEGIN USART3_Init 2 */
   /* USER CODE END USART3_Init 2 */
+
 }
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+
+}
+
 /**
   * @brief GPIO Initialization Function
   * @param None
@@ -490,31 +568,64 @@ static void MX_GPIO_Init(void)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
   /* USER CODE END MX_GPIO_Init_1 */
+
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);
+
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LCD_RES_Pin|LCD_DC_Pin, GPIO_PIN_SET);
+
   /*Configure GPIO pin : LCD_CS_Pin */
   GPIO_InitStruct.Pin = LCD_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LCD_CS_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pins : LCD_RES_Pin LCD_DC_Pin */
   GPIO_InitStruct.Pin = LCD_RES_Pin|LCD_DC_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /* USER CODE END MX_GPIO_Init_2 */
 }
+
 /* USER CODE BEGIN 4 */
+// ★추가: UART 수신 중 에러(overrun 등)가 나면 HAL이 인터럽트 수신을 자동으로 재시작 안 하고 멈춰버리기 때문에,
+// 에러 콜백에서 직접 다시 무장(re-arm)해줘야 함. 이거 없으면 에러 한 번만 나도 그 채널 수신이 영구히 멈춤.
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    __HAL_UART_CLEAR_OREFLAG(huart);   // Overrun 에러 플래그 클리어 (안 지우면 계속 에러 상태로 남아있을 수 있음)
+    __HAL_UART_CLEAR_NEFLAG(huart);    // Noise 에러 플래그 클리어
+    __HAL_UART_CLEAR_FEFLAG(huart);    // Framing 에러 플래그 클리어
+    __HAL_UART_CLEAR_PEFLAG(huart);    // Parity 에러 플래그 클리어
+
+    if (huart->Instance == USART1)                              // 레이더 채널이면 (★변경: DMA 방식이라 재시작도 DMA로)
+    {
+        radar_state = RADAR_WAIT_HEADER;                          // 상태기계도 처음부터 다시 시작하도록 리셋
+        radar_header_match = 0;
+        radar_dma_last_pos = 0;                                    // DMA 버퍼 읽기 위치도 초기화
+        HAL_UART_Receive_DMA(&huart1, (uint8_t*)radar_dma_buf, RADAR_DMA_BUF_SIZE);  // DMA 순환수신 재시작
+    }
+    else if (huart->Instance == USART2)                         // Pi 채널이면
+    {
+        HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);   // 인터럽트 수신 재무장
+    }
+    else if (huart->Instance == USART3)                         // ELM327/블루투스 채널이면
+    {
+        HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);      // 인터럽트 수신 재무장
+    }
+}
+
 void ELM327_RequestSpeed(void)             // 속도 요청 명령을 보내는 함수의 실제 내용(구현) 시작
 {                                           // 함수 블록 시작 중괄호
     uint8_t cmd[] = "010D\r"; // 전송할 명령 문자열을 담은 배열: OBD-II Mode01+PID0D(속도 요청)+캐리지리턴
@@ -540,6 +651,101 @@ int ParseSpeedResponse(const char *raw)    // 응답 문자열을 파싱하는 �
                                             // p 위치부터 16진수 2자리를 읽어 value에 저장 시도, 실패(읽은 개수가 1이 아니면)하면 -1 반환
     return (int)value;                     // 성공적으로 읽은 value를 정수로 형변환해서 최종 반환
 }                                           // ParseSpeedResponse 함수 블록 끝
+
+// ★추가: 레이더 바이트 하나를 상태기계에 넣어서 처리하는 함수
+// (예전엔 USART1 인터럽트 안에서 바로 처리했지만, DMA 방식으로 바꾸면서 메인루프가 DMA버퍼를 읽으며 이 함수를 호출하는 구조로 변경)
+void RadarProcessByte(uint8_t b)
+{
+    radar_raw_byte_count++;              // ★진단용: 헤더가 맞든 안 맞든 상관없이, 바이트가 들어올 때마다 무조건 1 증가
+    if (radar_debug_len < RADAR_DEBUG_BUF_LEN)   // ★진단용: 버퍼에 아직 공간이 남아있으면
+    {
+        radar_debug_buf[radar_debug_len++] = b;    // 받은 바이트를 그대로(가공 없이) 디버그 버퍼에 적재
+    }
+    switch (radar_state)                 // 지금 어느 단계인지에 따라 분기
+    {
+        case RADAR_WAIT_HEADER:                            // 헤더 4바이트를 찾는 중인 단계
+            if (b == RADAR_HEADER[radar_header_match])      // 기대하는 다음 헤더 바이트와 일치하면
+            {
+                radar_header_match++;                        // 연속 일치 카운트를 1 증가
+                if (radar_header_match >= RADAR_HDR_LEN)      // 헤더 4바이트가 전부 순서대로 일치했으면
+                {
+                    radar_state = RADAR_WAIT_LENGTH;           // 다음 단계(길이필드 읽기)로 전환
+                    radar_payload_idx = 0;                     // 길이필드 임시 인덱스로 재사용(0=하위바이트 차례)
+                }
+            }
+            else                                             // 기대한 바이트가 아니면(동기화가 깨진 경우)
+            {
+                radar_header_match = (b == RADAR_HEADER[0]) ? 1 : 0;
+            }
+            break;
+
+        case RADAR_WAIT_LENGTH:                            // 길이필드 2바이트를 받는 중인 단계
+            if (radar_payload_idx == 0)                      // 길이필드의 첫 바이트(하위바이트, 리틀엔디안 가정)
+            {
+                radar_payload_len = b;                         // 하위바이트를 그대로 저장
+                radar_payload_idx = 1;                         // 다음 차례는 상위바이트
+            }
+            else                                               // 길이필드의 두 번째 바이트(상위바이트)
+            {
+                radar_payload_len |= ((uint16_t)b << 8);        // 상위바이트를 8비트 왼쪽으로 밀어서 합침
+                if (radar_payload_len > RADAR_MAX_PAYLOAD)       // 비정상적으로 큰 길이값이면(노이즈로 헤더가 우연히 맞은 경우 등)
+                {
+                    radar_state = RADAR_WAIT_HEADER;              // 이 프레임은 버리고 처음부터 헤더 재탐색
+                    radar_header_match = 0;
+                }
+                else                                              // 정상 범위의 길이값이면
+                {
+                    radar_state = RADAR_WAIT_PAYLOAD;              // 페이로드 수신 단계로 전환
+                    radar_payload_idx = 0;                         // 페이로드를 채울 인덱스 초기화
+                }
+            }
+            break;
+
+        case RADAR_WAIT_PAYLOAD:                            // 페이로드를 길이필드만큼 받는 중인 단계
+            radar_payload_buf[radar_payload_idx++] = b;        // 받은 바이트를 페이로드 버퍼에 저장하고 인덱스 증가
+            if (radar_payload_idx >= radar_payload_len)         // 정해진 길이만큼 다 받았으면
+            {
+                radar_state = RADAR_WAIT_TAIL;                   // 테일 확인 단계로 전환
+                radar_tail_idx = 0;                              // 테일 인덱스 초기화
+            }
+            break;
+
+        case RADAR_WAIT_TAIL:                               // 테일 4바이트가 맞는지 확인하는 단계
+            if (b == RADAR_TAIL[radar_tail_idx])                // 기대하는 테일 바이트와 일치하면
+            {
+                radar_tail_idx++;                                // 일치 카운트 증가
+                if (radar_tail_idx >= RADAR_TAIL_LEN)             // 테일 4바이트가 전부 확인됐으면
+                {
+                    radar_frame_ready = 1;                         // 완전한 프레임 하나 완성! 메인루프에 신호
+                    radar_state = RADAR_WAIT_HEADER;               // 다음 프레임을 위해 처음 상태로 복귀
+                    radar_header_match = 0;
+                }
+            }
+            else                                                 // 테일이 기대값과 다르면(깨진 프레임)
+            {
+                radar_state = RADAR_WAIT_HEADER;                    // 이번 프레임은 버리고 헤더 재탐색으로 복귀
+                radar_header_match = (b == RADAR_HEADER[0]) ? 1 : 0; // 이 바이트가 다음 프레임의 시작일 수도 있으니 체크
+            }
+            break;
+    }
+}
+
+// ★추가: DMA 순환버퍼에 새로 쌓인 바이트들을 메인루프에서 꺼내 하나씩 RadarProcessByte()에 넘겨 처리하는 함수
+// DMA가 하드웨어적으로 계속 radar_dma_buf를 채우고 있으므로, 여기서는 "지금까지 얼마나 채워졌는지" 위치만 계산해서
+// 아직 처리 안 한 구간만 꺼내 쓰면 됨 (원형버퍼라 끝에 도달하면 다시 처음으로 돌아감)
+void RadarProcessDmaBuffer(void)
+{
+    uint16_t dma_write_pos = RADAR_DMA_BUF_SIZE - __HAL_DMA_GET_COUNTER(huart1.hdmarx);
+    // __HAL_DMA_GET_COUNTER: DMA가 "앞으로 몇 바이트 더 채울 수 있는지(남은 카운트)"를 알려줌
+    // 전체 버퍼크기에서 그 남은 카운트를 빼면, 지금까지 DMA가 실제로 채워넣은 위치(인덱스)가 나옴
+
+    while (radar_dma_last_pos != dma_write_pos)          // 아직 처리 안 한 새 바이트가 있는 동안 계속 반복
+    {
+        RadarProcessByte(radar_dma_buf[radar_dma_last_pos]);  // 그 위치의 바이트를 상태기계로 처리
+        radar_dma_last_pos = (radar_dma_last_pos + 1) % RADAR_DMA_BUF_SIZE;  // 다음 위치로 이동 (끝에 닿으면 0으로 순환)
+    }
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3)          // USART3(HC-05/ELM327)에서 발생한 인터럽트인 경우
@@ -556,85 +762,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
         HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);
     }
-    else if (huart->Instance == USART1)      // USART1(레이더)에서 발생한 인터럽트인 경우 — 새 프로토콜 기준 상태기계로 재작성
-    {
-        uint8_t b = radar_byte;              // 이번에 새로 받은 1바이트를 지역변수에 복사
-        radar_raw_byte_count++;              // ★진단용: 헤더가 맞든 안 맞든 상관없이, 바이트가 들어올 때마다 무조건 1 증가
-        if (radar_debug_len < RADAR_DEBUG_BUF_LEN)   // ★진단용: 버퍼에 아직 공간이 남아있으면
-        {
-            radar_debug_buf[radar_debug_len++] = b;    // 받은 바이트를 그대로(가공 없이) 디버그 버퍼에 적재
-        }
-        switch (radar_state)                 // 지금 어느 단계인지에 따라 분기
-        {
-            case RADAR_WAIT_HEADER:                            // 헤더 4바이트를 찾는 중인 단계
-                if (b == RADAR_HEADER[radar_header_match])      // 기대하는 다음 헤더 바이트와 일치하면
-                {
-                    radar_header_match++;                        // 연속 일치 카운트를 1 증가
-                    if (radar_header_match >= RADAR_HDR_LEN)      // 헤더 4바이트가 전부 순서대로 일치했으면
-                    {
-                        radar_state = RADAR_WAIT_LENGTH;           // 다음 단계(길이필드 읽기)로 전환
-                        radar_payload_idx = 0;                     // 길이필드 임시 인덱스로 재사용(0=하위바이트 차례)
-                    }
-                }
-                else                                             // 기대한 바이트가 아니면(동기화가 깨진 경우)
-                {
-                    // 지금 받은 바이트가 우연히 헤더의 첫 바이트(0xF4)일 수도 있으니 그 경우만 1로,
-                    // 아니면 0으로 리셋해서 처음부터 다시 헤더를 찾는다
-                    radar_header_match = (b == RADAR_HEADER[0]) ? 1 : 0;
-                }
-                break;
-
-            case RADAR_WAIT_LENGTH:                            // 길이필드 2바이트를 받는 중인 단계
-                if (radar_payload_idx == 0)                      // 길이필드의 첫 바이트(하위바이트, 리틀엔디안 가정)
-                {
-                    radar_payload_len = b;                         // 하위바이트를 그대로 저장
-                    radar_payload_idx = 1;                         // 다음 차례는 상위바이트
-                }
-                else                                               // 길이필드의 두 번째 바이트(상위바이트)
-                {
-                    radar_payload_len |= ((uint16_t)b << 8);        // 상위바이트를 8비트 왼쪽으로 밀어서 합침
-                    if (radar_payload_len > RADAR_MAX_PAYLOAD)       // 비정상적으로 큰 길이값이면(노이즈로 헤더가 우연히 맞은 경우 등)
-                    {
-                        radar_state = RADAR_WAIT_HEADER;              // 이 프레임은 버리고 처음부터 헤더 재탐색
-                        radar_header_match = 0;
-                    }
-                    else                                              // 정상 범위의 길이값이면
-                    {
-                        radar_state = RADAR_WAIT_PAYLOAD;              // 페이로드 수신 단계로 전환
-                        radar_payload_idx = 0;                         // 페이로드를 채울 인덱스 초기화
-                    }
-                }
-                break;
-
-            case RADAR_WAIT_PAYLOAD:                            // 페이로드를 길이필드만큼 받는 중인 단계
-                radar_payload_buf[radar_payload_idx++] = b;        // 받은 바이트를 페이로드 버퍼에 저장하고 인덱스 증가
-                if (radar_payload_idx >= radar_payload_len)         // 정해진 길이만큼 다 받았으면
-                {
-                    radar_state = RADAR_WAIT_TAIL;                   // 테일 확인 단계로 전환
-                    radar_tail_idx = 0;                              // 테일 인덱스 초기화
-                }
-                break;
-
-            case RADAR_WAIT_TAIL:                               // 테일 4바이트가 맞는지 확인하는 단계
-                if (b == RADAR_TAIL[radar_tail_idx])                // 기대하는 테일 바이트와 일치하면
-                {
-                    radar_tail_idx++;                                // 일치 카운트 증가
-                    if (radar_tail_idx >= RADAR_TAIL_LEN)             // 테일 4바이트가 전부 확인됐으면
-                    {
-                        radar_frame_ready = 1;                         // 완전한 프레임 하나 완성! 메인루프에 신호
-                        radar_state = RADAR_WAIT_HEADER;               // 다음 프레임을 위해 처음 상태로 복귀
-                        radar_header_match = 0;
-                    }
-                }
-                else                                                 // 테일이 기대값과 다르면(깨진 프레임)
-                {
-                    radar_state = RADAR_WAIT_HEADER;                    // 이번 프레임은 버리고 헤더 재탐색으로 복귀
-                    radar_header_match = (b == RADAR_HEADER[0]) ? 1 : 0; // 이 바이트가 다음 프레임의 시작일 수도 있으니 체크
-                }
-                break;
-        }
-        HAL_UART_Receive_IT(&huart1, (uint8_t*)&radar_byte, 1);   // 다음 1바이트를 또 받기 위해 인터럽트 재무장 (기존과 동일)
-    }
+    // ★변경: USART1(레이더)은 이제 DMA 순환수신 방식이라 여기서 바이트 단위로 처리하지 않음
+    // (DMA는 buffer 전체를 다 채워야만 이 콜백이 호출되는데, 우리는 그 전에 메인루프의
+    //  RadarProcessDmaBuffer()에서 이미 다 처리하고 있으므로 이 콜백에서 USART1은 따로 처리할 게 없음)
     else if (huart->Instance == USART2)      // USART2(Pi)에서 발생한 인터럽트인 경우
     {
         char c = (char)pi_rx_byte;           // 받은 1바이트를 문자로 변환
@@ -936,6 +1066,7 @@ void LCD_FillScreen(uint16_t color)
     HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);  // 다 끝났으면 CS를 다시 HIGH로 (전송 종료)
 }
 /* USER CODE END 4 */
+
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
