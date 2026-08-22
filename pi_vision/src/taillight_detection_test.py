@@ -11,9 +11,9 @@
 측정 방식:
 - 밝기값은 단순 R채널 평균이 아니라 "redness = R - (G+B)/2" (빨간정도)로 계산
   → 헤드라이트나 전체적인 노출변화(흰 빛)로 화면이 밝아지는 것과, 실제 빨간 브레이크등이 켜지는 걸 더 잘 구분함
-- ON/OFF 판정은 시작할 때(30프레임째) 자동으로 잡은 "장기 기준값(baseline)"과 비교함
+- ON/OFF 판정은 "최근 25초간 관찰값 중 최솟값"을 baseline으로 계속 실시간 갱신하면서 비교함(v3/v4 참고)
   (프레임 간 순간 변화량만 보면, 브레이크등이 몇 초씩 계속 켜져있을 때 "꺼졌다"고 착각하는 문제가 있어서
-   장기 기준값 방식을 그대로 유지함 — 대신 blob "위치를 찾는" 단계에서는 HSV 빨간색 검출을 그대로 씀)
+   장기(25초) 기준값 방식을 씀 — 대신 blob "위치를 찾는" 단계에서는 HSV 빨간색 검출을 그대로 씀)
 
 (Pi 등 화면(모니터) 없는 환경용 — cv2.imshow 대신 파일 저장 + 터미널 로그 방식)
 
@@ -54,11 +54,25 @@ import serial                                        # STM32와 시리얼(UART) 
 import threading                                     # 시리얼 읽기를 메인 영상처리 루프와 분리된 스레드로 돌리기 위함
 
 SMOOTHING_FRAMES = 5
-DELTA_THRESHOLD = 15.0          # 이 값(redness 기준) 이상 밝아지면 "브레이크등 켜짐"으로 판정
+# ★변경(v4): 절대값 차이(delta) 대신 baseline 대비 "비율(%)"로 판정 기준을 바꿈
+# → 앞차와의 거리에 따라 redness/면적의 절대 크기 자체가 달라지므로(가까울수록 크게 잡힘),
+#   절대 차이 기준(예: +15)으로는 가까이/멀리 있을 때 기준이 안 맞음. 비율로 보면 거리 무관하게 일관됨
+REDNESS_RATIO_THRESHOLD = 0.35   # baseline 대비 redness(색 진하기)가 이 비율(35%) 이상 늘면 "밝아짐" 후보
+AREA_RATIO_THRESHOLD = 0.50      # baseline 대비 면적(빛이 번져 보이는 크기)이 이 비율(50%) 이상 늘면 "밝아짐" 후보
+# ★변경: 색 진하기(redness) OR 면적(area) 둘 중 하나라도 크게 튀면 "밝아짐"으로 판정
+# (브레이크등은 색만 진해지는 게 아니라 빛이 번지면서 눈에 보이는 면적도 커지는 경우가 많아서,
+#  두 신호를 같이 보면 한쪽만 볼 때보다 더 안정적으로 잡을 수 있음)
 MIN_RED_PIXELS = 8              # ★변경: 멀리 있는 작은 빛도 잡아야 하니 기존(15)보다 낮춤
 PADDING = 5
-SAVE_EVERY_N_FRAMES = 5
-BASELINE_AT_FRAME = 30
+SAVE_EVERY_N_FRAMES = 2   # ★변경: 5→2 (live_view_server 화면 갱신 체감 속도를 위해 더 자주 저장, Pi CPU 여유 있으면 문제없음)
+# ★변경(v3): "시작할 때 딱 한 번" 잡고 계속 쓰는 baseline은 실제 주행이랑 안 맞음 — 앞차가 계속
+# 바뀌는데(추월당함/앞차가 빠짐/신호에서 다른 차) 세션 시작 시점 값 하나로 주행 내내 버티는 건 무리임
+# → "최근 BASELINE_WINDOW_SEC초 동안 관찰한 값 중 최솟값"을 baseline으로 계속 실시간 갱신함
+#   (미등 상태가 항상 제일 어두우니, 최근 몇십 초 안에 브레이크 안 밟은 순간이 한 번은 있었을 것이라는 전제)
+# 트레이드오프: 이 시간(윈도우)보다 더 오래 브레이크를 계속 밟고 있으면 baseline이 그 밝은 값 쪽으로
+# 끌려 올라가서 오판 위험 있음 — 근데 도로에서 30초씩 계속 브레이크 밟는 경우는 거의 없다고 보고 이 값으로 설정
+BASELINE_WINDOW_SEC = 25.0     # 최근 몇 초 데이터로 baseline(최솟값)을 계산할지
+BASELINE_WARMUP_SEC = 3.0      # 최소 이 정도는 데이터가 쌓여야 baseline을 신뢰함 (콜드스타트에 값 1개짜리가 baseline 되는 거 방지)
 
 # ===== ★추가: 관심영역(ROI) 설정 — 화면 전체가 아니라 이 구역 안에서만 빨간 덩어리를 찾음 =====
 # 카메라가 차량 정면 고정이라, 내 차선 앞차는 대략 이 범위 안에 있을 거라는 전제
@@ -91,6 +105,13 @@ CAPTURE_HEIGHT = 720
 WORK_WIDTH = 640    # 실제 처리(빨간블롭 찾기 등)에 쓸 작업용 해상도 (너무 크면 Pi CPU 부담)
 WORK_HEIGHT = 480
 
+# ===== ★추가: 디지털 줌 — 원본 캡처 프레임의 중앙 부분만 잘라서 WORK 해상도로 확대함 =====
+# 멀리 있는 브레이크등이 화면에서 너무 작게(적은 픽셀 수로) 잡혀서 블롭 검출이 어려운 문제 완화용
+# 반드시 "자르기(crop) 먼저 → 그 다음에 확대(resize)" 순서로 해야 함 (반대로 하면 이미 저해상도로
+# 줄어든 걸 자르는 거라 확대 효과가 없음)
+DIGITAL_ZOOM_CROP_RATIO = 0.60   # 원본 프레임 중앙의 이 비율만큼만 잘라서 씀 (0.60 ≈ 1.67배 줌)
+                                  # 값을 낮출수록(예: 0.4) 더 확대됨, 대신 화면에 보이는 범위(FOV)는 더 좁아짐
+
 # ===== ★STM32 시리얼 통신 설정 =====
 STM32_PORT = '/dev/serial0'                         # 라즈베리파이의 GPIO UART 포트 (STM32 USART2와 연결된 핀)
                                                      # 안 열리면 '/dev/ttyAMA0'으로도 시도해볼 것 (Pi 설정에 따라 이름 다를 수 있음)
@@ -103,6 +124,29 @@ latest_radar_angle = None                           # STM32가 보내준 최신 
 latest_radar_update_time = 0.0                      # 마지막으로 "유효한"(distance>=0) 레이더 데이터를 받은 시각
 radar_angle_history = deque(maxlen=RADAR_ANGLE_HISTORY_LEN)  # ★추가: 최근 유효 각도값들 — median 계산해서 노이즈 억제하는 데 씀
 serial_data_lock = threading.Lock()                 # 백그라운드 스레드랑 메인루프가 동시에 위 변수들을 건드리지 않도록 보호하는 락
+
+
+class SlidingMinBaseline:
+    # ★추가(v4): redness랑 area 둘 다 "최근 N초 관찰값 중 최솟값" 방식으로 baseline을 잡아야 해서,
+    # 중복 코드를 피하려고 공통 로직을 클래스로 뽑음. 두 개(redness용, area용)를 각각 만들어서 씀.
+    def __init__(self, window_sec, warmup_sec):
+        self.window_sec = window_sec
+        self.warmup_sec = warmup_sec
+        self.buffer = deque()          # (시각, 값) 튜플들의 슬라이딩 윈도우
+        self.first_sample_time = None  # 워밍업 시간 계산용
+        self.value = None              # 현재 확정된 baseline (아직 워밍업 안 끝났으면 None)
+
+    def update(self, now_t, sample):
+        self.buffer.append((now_t, sample))
+        if self.first_sample_time is None:
+            self.first_sample_time = now_t
+        while self.buffer and self.buffer[0][0] < now_t - self.window_sec:   # 오래된 값 버림
+            self.buffer.popleft()
+        if (self.first_sample_time is not None
+                and (now_t - self.first_sample_time) >= self.warmup_sec
+                and self.buffer):
+            self.value = min(v for _, v in self.buffer)
+        return self.value
 
 
 def stm32_serial_reader(ser):                       # STM32에서 오는 "R,거리,속도,각도" 줄을 계속 읽어서 전역변수에 저장하는 함수 (별도 스레드에서 실행됨)
@@ -183,6 +227,18 @@ def find_red_blobs(frame, region, max_blobs):
     return results
 
 
+def apply_digital_zoom(frame):
+    # ★추가: 원본 프레임의 중앙 DIGITAL_ZOOM_CROP_RATIO 비율만 잘라낸 뒤, WORK 해상도로 다시 키움
+    # (자르기 → 확대 순서가 중요함. 이미 축소된 걸 자르면 확대해도 디테일이 못 살아남)
+    h, w = frame.shape[:2]
+    crop_w = int(w * DIGITAL_ZOOM_CROP_RATIO)
+    crop_h = int(h * DIGITAL_ZOOM_CROP_RATIO)
+    x1 = (w - crop_w) // 2
+    y1 = (h - crop_h) // 2
+    cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
+    return cv2.resize(cropped, (WORK_WIDTH, WORK_HEIGHT))
+
+
 def get_redness(frame, roi):
     # ★변경: 단순 R채널 평균 대신 "redness = R - (G+B)/2"를 씀
     # → 전체 화면이 밝아지는 것(헤드라이트, 노출변화)과 실제 빨간 브레이크등이 켜지는 걸 더 잘 구분함
@@ -247,7 +303,7 @@ def scan_roi_for_brake_light(frame):
 
     blobs = find_red_blobs(frame, (rx1, ry1, rx2, ry2), max_blobs=MAX_BLOBS_IN_ROI)
     if not blobs:
-        return None, 0, "NO_BLOB"
+        return None, 0, "NO_BLOB", 0.0
 
     radar_x = get_radar_target_x(w)          # None이면 레이더 신뢰 불가 → 게이팅 안 함
     used_blobs = blobs
@@ -264,16 +320,18 @@ def scan_roi_for_brake_light(frame):
             mode = "RADAR_DISAGREE"           # 레이더 위치엔 빨간 블롭이 없음 → 안전하게 전체 블롭 사용(신호 놓치지 않기 위해)
 
     redness_values = []
+    total_area = 0.0   # ★추가(v4): 사용된 블롭들의 면적 합 — redness랑 별개로 "빛이 번져 보이는 크기" 신호로 씀
     for (bx1, by1, bx2, by2) in used_blobs:
         box_color = (0, 255, 0) if mode == "RADAR_GATED" else (0, 200, 200)  # 레이더로 골라진 블롭=초록, 아니면 청록으로 구분
         cv2.rectangle(frame, (bx1, by1), (bx2, by2), box_color, 2)
         rv = get_redness(frame, (bx1, by1, bx2, by2))
         if rv is not None:
             redness_values.append(rv)
+        total_area += max(0, bx2 - bx1) * max(0, by2 - by1)   # 박스 면적(패딩 포함, 상대적 크기 비교용이라 이 정도면 충분)
 
     if redness_values:
-        return float(np.mean(redness_values)), len(used_blobs), mode
-    return None, 0, mode
+        return float(np.mean(redness_values)), len(used_blobs), mode, total_area
+    return None, 0, mode, total_area
 
 
 def main():
@@ -299,51 +357,75 @@ def main():
         stm32_ser = None                                    # STM32 연결 안 된 상태로 표시
         print(f"[STM32] 시리얼 연결 실패 (레이더 데이터 없이 영상처리만 진행): {e}")
 
-    history = deque(maxlen=SMOOTHING_FRAMES)
-    baseline = None
+    history = deque(maxlen=SMOOTHING_FRAMES)        # redness 스무딩용
+    area_history = deque(maxlen=SMOOTHING_FRAMES)    # ★추가(v4): area 스무딩용 (redness랑 같은 방식)
+    redness_baseline = SlidingMinBaseline(BASELINE_WINDOW_SEC, BASELINE_WARMUP_SEC)
+    area_baseline = SlidingMinBaseline(BASELINE_WINDOW_SEC, BASELINE_WARMUP_SEC)
     last_redness = None
     frame_count = 0
     last_b_send_time = 0.0
     last_c_send_time = 0.0
-    print("Ctrl+C로 종료 | 5프레임마다 latest_frame.jpg 저장 | 30프레임째 자동 베이스라인 설정")
+    baseline_announced = False   # ★추가: baseline이 처음 잡히는 순간 로그로 한 번 알려주기 위한 플래그
+    print(f"Ctrl+C로 종료 | 2프레임마다 latest_frame.jpg 저장 | 베이스라인(redness/area 각각)은 최근 {BASELINE_WINDOW_SEC:.0f}초 최솟값으로 실시간 갱신")
+    print(f"판정: baseline 대비 redness {REDNESS_RATIO_THRESHOLD*100:.0f}% 또는 area {AREA_RATIO_THRESHOLD*100:.0f}% 이상 증가 시 '밝아짐'(거리 무관 비율 기준)")
     print(f"스캔 ROI(항상 고정, 레이더 상태와 무관): 가로 {ROI_X1_RATIO*100:.0f}~{ROI_X2_RATIO*100:.0f}%, 세로 {ROI_Y1_RATIO*100:.0f}~{ROI_Y2_RATIO*100:.0f}%")
     print(f"레이더 게이팅: 신뢰 가능(연속 {RADAR_MIN_SAMPLES}샘플+최근 {RADAR_STALE_TIMEOUT_SEC:.0f}초 이내)할 때만, 위치 ±{RADAR_GATE_HALF_WIDTH_RATIO*100:.0f}% 안 블롭만 우선 사용 (불일치시 자동 폴백)")
+    print(f"디지털 줌: 중앙 {DIGITAL_ZOOM_CROP_RATIO*100:.0f}% 크롭 → {WORK_WIDTH}x{WORK_HEIGHT}로 확대 (약 {1/DIGITAL_ZOOM_CROP_RATIO:.2f}배)")
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 print("프레임을 읽을 수 없습니다.")
                 break
-            frame = cv2.resize(frame, (WORK_WIDTH, WORK_HEIGHT))
+            frame = apply_digital_zoom(frame)   # ★변경: 단순 리사이즈 대신 중앙 크롭+확대로 디지털 줌 적용
             frame_count += 1
 
             # ===== ★변경: YOLO 없이 매 프레임 바로 ROI에서 빨간 덩어리 스캔 (더 이상 N프레임마다 건너뛸 필요 없음, 훨씬 가벼움) =====
-            redness, blob_count, radar_mode = scan_roi_for_brake_light(frame)
+            redness, blob_count, radar_mode, area = scan_roi_for_brake_light(frame)
             blob_found = redness is not None
 
             if blob_found:
                 last_redness = redness
                 history.append(redness)
+                area_history.append(area)
                 smoothed = float(np.mean(history))
-                delta = None
-                if baseline is not None:
-                    delta = smoothed - baseline
-                    status = "ANOMALY" if delta > DELTA_THRESHOLD else "normal"
+                smoothed_area = float(np.mean(area_history))
+                now_t = time.time()
+
+                # ===== ★변경(v4): redness/area 각각 슬라이딩 윈도우 baseline 갱신 =====
+                r_base = redness_baseline.update(now_t, redness)
+                a_base = area_baseline.update(now_t, area)
+                if r_base is not None and not baseline_announced:
+                    print(f"[자동] 베이스라인 첫 설정(frame={frame_count}): redness={r_base:.1f} (이후 계속 실시간 갱신됨)")
+                    baseline_announced = True
+
+                # ===== ★변경(v4): 절대 delta 대신 baseline 대비 비율(%)로 판정 — redness OR area 둘 중 하나만 튀어도 "밝아짐" =====
+                redness_ratio = ((smoothed - r_base) / r_base) if (r_base is not None and r_base > 1e-6) else None
+                area_ratio = ((smoothed_area - a_base) / a_base) if (a_base is not None and a_base > 1e-6) else None
+                brightening = ((redness_ratio is not None and redness_ratio > REDNESS_RATIO_THRESHOLD)
+                                or (area_ratio is not None and area_ratio > AREA_RATIO_THRESHOLD))
+
+                if redness_ratio is not None:
+                    # ★변경(용어 정정): "ANOMALY"는 오해 소지가 큼 — 여기서 밝아짐 판정은 "브레이크등이
+                    # 정상적으로 켜짐(좋은 상황)"을 뜻하는데 화면엔 마치 문제 생긴 것처럼 보였음
+                    # (진짜 "이상"은 STM32 쪽에서 감속중인데 이게 하나도 안 뜨는 상황을 말함)
+                    status = "BRAKE-ON?" if brightening else "steady"
+                    area_pct_str = f"/{area_ratio*100:+.0f}%" if area_ratio is not None else ""
                     # ★참고: cv2.putText는 한글(유니코드) 렌더링을 지원하지 않아 화면에 "????"로 깨져 나옴
                     #        → 화면 표시용 텍스트는 영어로, 터미널 로그(print)는 한글 그대로 유지
-                    cv2.putText(frame, f"delta={delta:.1f} {status}", (10, 55),
+                    cv2.putText(frame, f"r{redness_ratio*100:+.0f}%{area_pct_str} {status}", (10, 55),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                    # ===== ★STM32로 밝기 델타/이상여부 전송 (200ms 속도 제한) =====
-                    now_t = time.time()
+                    # ===== ★STM32로 밝기 비율/이상여부 전송 (200ms 속도 제한) =====
                     if stm32_ser is not None and (now_t - last_b_send_time) >= STM32_SEND_INTERVAL_SEC:
                         try:
-                            anomaly_flag = 1 if delta > DELTA_THRESHOLD else 0   # 밝아짐 감지되면 1, 아니면 0
-                            msg = f"B,{delta:.1f},{anomaly_flag}\r\n"            # "B,밝기델타,이상여부\r\n" 형식으로 조립
+                            anomaly_flag = 1 if brightening else 0   # 밝아짐 감지되면 1, 아니면 0
+                            # ★변경: 두 번째 필드가 이제 "절대 밝기차"가 아니라 "redness 증가율(%)"임 (STM32는 그냥 표시만 하므로 파싱 영향 없음)
+                            msg = f"B,{redness_ratio*100:.1f},{anomaly_flag}\r\n"   # "B,증가율(%),이상여부\r\n" 형식으로 조립
                             stm32_ser.write(msg.encode('utf-8'))                  # STM32로 전송
                             last_b_send_time = now_t                              # 마지막 전송 시각 갱신
                         except Exception as e:
                             print(f"[STM32] 전송 에러: {e}")
-                cv2.putText(frame, f"redness={smoothed:.1f} (blobs={blob_count})", (10, 75),
+                cv2.putText(frame, f"redness={smoothed:.1f} area={smoothed_area:.0f} (blobs={blob_count})", (10, 75),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
             if not blob_found:
@@ -367,9 +449,7 @@ def main():
                 except Exception as e:
                     print(f"[STM32] 카메라상태 전송 에러: {e}")
 
-            if frame_count == BASELINE_AT_FRAME and last_redness is not None:
-                baseline = last_redness
-                print(f"[자동] 베이스라인 설정: {baseline:.1f}")
+            # (baseline은 이제 위쪽 blob_found 블록 안에서 슬라이딩 윈도우 방식으로 계속 실시간 갱신됨)
 
             if frame_count % SAVE_EVERY_N_FRAMES == 0:
                 cv2.imwrite("latest_frame.jpg", frame)
@@ -379,11 +459,15 @@ def main():
                         angle_str = f"/A{latest_radar_angle:.0f}" if latest_radar_angle is not None else ""
                         radar_info = f", radar=D{latest_radar_distance:.1f}/S{latest_radar_speed:.1f}{angle_str}"
                 if last_redness is not None:
-                    delta_str = ""
-                    if baseline is not None:
-                        d = last_redness - baseline
-                        delta_str = f", delta={d:.1f}"
-                    print(f"frame={frame_count}, redness={last_redness:.1f}{delta_str}{radar_info}, mode={radar_mode}")
+                    ratio_str = ""
+                    if redness_baseline.value is not None:
+                        r_pct = (last_redness - redness_baseline.value) / redness_baseline.value * 100 if redness_baseline.value > 1e-6 else 0
+                        a_pct_str = ""
+                        if area_baseline.value is not None and area_baseline.value > 1e-6:
+                            a_pct = (area - area_baseline.value) / area_baseline.value * 100
+                            a_pct_str = f", area{a_pct:+.0f}%"
+                        ratio_str = f", redness{r_pct:+.0f}%{a_pct_str}"
+                    print(f"frame={frame_count}, redness={last_redness:.1f}{ratio_str}{radar_info}, mode={radar_mode}")
                 else:
                     print(f"frame={frame_count}, 빨간불빛 미검출{radar_info}, mode={radar_mode}")
     except KeyboardInterrupt:

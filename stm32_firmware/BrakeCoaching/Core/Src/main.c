@@ -111,9 +111,17 @@ volatile uint8_t radar_dma_buf[RADAR_DMA_BUF_SIZE];                // DMA가 하
 volatile uint16_t radar_dma_last_pos = 0;                          // 마지막으로 처리(소비)한 위치(인덱스)
 // ===== DMA 관련 추가 끝 =====
 
-volatile float radar_distance_m  = -1.0f;   // 파싱된 최신 거리값(m), -1.0=유효값 없음
-volatile float radar_speed_kmh   = 0.0f;    // 파싱된 최신 상대속도값(km/h), 양수=멀어짐/음수=가까워짐
+volatile float radar_distance_m  = -1.0f;   // 파싱된 최신 거리값(m), -1.0=유효값 없음 (median 스무딩 적용된 값)
+volatile float radar_speed_kmh   = 0.0f;    // 파싱된 최신 상대속도값(km/h), 양수=멀어짐/음수=가까워짐 (median 스무딩 적용된 값)
 volatile int8_t radar_angle_deg  = 0;       // 파싱된 최신 각도값(도)
+
+// ★추가: 실차 테스트에서 거리값이 프레임마다 완전히 다른 물체로 튀는 문제(예: 2m→47m) 발견 후 추가한 상태값들
+volatile float radar_track_distance_m = -1.0f;  // "지금 추적 중인 차"의 최근 원시 거리값 (다음 프레임에서 같은 차인지 판단하는 기준), -1=트랙 없음
+#define RADAR_TRACK_GATE_M 6.0f                   // 이 거리(m) 이내의 타겟만 "같은 차(트랙 유지)"로 인정. 그보다 크게 차이나면 다른 물체로 간주하고 재탐색
+static float radar_dist_hist[3]  = {0.0f, 0.0f, 0.0f};  // 최근 3프레임 원시 거리값 버퍼 (median 스무딩용)
+static float radar_speed_hist[3] = {0.0f, 0.0f, 0.0f};  // 최근 3프레임 원시 속도값 버퍼
+static uint8_t radar_hist_idx    = 0;             // 버퍼에 다음 값을 쓸 위치(0~2 순환)
+static uint8_t radar_hist_count  = 0;             // 지금까지 몇 개 쌓였는지 (3 미만이면 아직 스무딩 없이 최신값 그대로 사용)
 // ===== 레이더 관련 새 코드 끝 =====
 
 // ===== Pi 통신(USART2) 관련 =====
@@ -770,8 +778,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2 다음 바이트 재무장
     }
 }
+// ★추가: 3개 값의 중간값(median) 반환 — 순간적으로 1개만 튀는 노이즈를 무시하기 위한 스무딩용
+static float Median3(float a, float b, float c)
+{
+    if (a > b) { float tmp = a; a = b; b = tmp; }
+    if (b > c) { float tmp = b; b = c; c = tmp; }
+    if (a > b) { float tmp = a; a = b; b = tmp; }
+    return b;                                                   // 정렬 후 가운데 값
+}
+
 // 완성된 레이더 프레임(페이로드)을 해석해서 거리/속도/각도로 변환하는 함수
-// ⚠ 길이필드 엔디안(리틀/빅), 다중 타겟일 때 "앞차"를 뭘로 고를지는 실측 후 재확인 필요
+// ⚠ 길이필드 엔디안(리틀/빅)은 실측 후 재확인 필요
 void ParseRadarFrame(void)
 {
     if (radar_payload_len < 1) return;                    // 최소한 타겟개수 1바이트는 있어야 함, 없으면 그냥 종료
@@ -781,6 +798,8 @@ void ParseRadarFrame(void)
     if (target_count == 0 || target_count > RADAR_MAX_TARGET)  // 타겟이 0개(아무것도 없음)거나 비정상적으로 많으면
     {
         radar_distance_m = -1.0f;                            // "유효한 타겟 없음" 상태로 표시해둠
+        radar_track_distance_m = -1.0f;                       // ★추가: 타겟이 사라졌으니 트랙(연속성)도 리셋 — 다음에 나타나는 건 새 차일 수 있으므로
+        radar_hist_count = 0;                                 // ★추가: median 버퍼도 리셋 (끊긴 값을 다음 차 값이랑 섞어서 중간값 내면 안 되니까)
         return;                                                // 더 처리할 게 없으므로 함수 종료
     }
 
@@ -788,23 +807,44 @@ void ParseRadarFrame(void)
     uint16_t expected_len = 1 + (uint16_t)target_count * RADAR_TARGET_SZ;
     if (expected_len > radar_payload_len) return;            // 길이가 안 맞으면(깨진 데이터일 가능성) 그냥 무시하고 종료
 
-    // ★변경: 실차 테스트 결과 "항상 첫 번째 타겟" 방식은 거리값이 프레임마다 심하게 튀는 문제가 있었음
-    // (옆차선 차/가드레일 등 다른 물체가 매 프레임 타겟 순서를 바꿔가며 1번 자리를 차지했던 것으로 추정)
-    // → 여러 타겟 중 "각도가 정면(0도)에 가장 가까운 것"을 앞차로 선택하도록 변경 (내 차 앞에 있는 차라면 각도가 0에 가까울 것이라는 가정)
-    uint8_t best_idx = 0;                                     // 지금까지 찾은 것 중 정면에 가장 가까운 타겟의 인덱스
-    int16_t best_abs_angle = 0x7FFF;                          // 지금까지 찾은 최소 |각도| (처음엔 매우 큰 값으로 초기화해서 첫 타겟이 무조건 갱신되게 함)
-    for (uint8_t i = 0; i < target_count; i++)                // 이번 프레임에 있는 모든 타겟을 순회
+    // ★변경: "각도가 0에 가장 가까운 타겟"만으로 고르던 방식은, 매 프레임 독립적으로 다시 고르다 보니
+    // 각도가 비슷한 서로 다른 물체(옆차/도로 옆 구조물 등) 사이에서 완전히 튀어버리는 문제가 있었음
+    // (실측: 거리값이 2m → 47m 처럼 순간이동. 같은 차라면 절대 그렇게 못 바뀜)
+    // → 1순위: "이전 프레임에서 추적하던 거리값과 비슷한(±RADAR_TRACK_GATE_M 이내) 타겟"을 최우선으로 선택 (연속성 유지)
+    //    2순위: 그런 후보가 없으면(트랙이 없거나, 진짜로 새 차가 나타난 경우) 기존 방식(각도 0에 최소)으로 재탐색
+    uint8_t best_idx = 0xFF;                                  // 0xFF = 아직 못 찾음
+    if (radar_track_distance_m >= 0.0f)                       // 이전에 추적하던 거리값(트랙)이 있으면
     {
-        const volatile uint8_t *ti = &radar_payload_buf[1 + i * RADAR_TARGET_SZ];  // i번째 타겟 블록 시작 위치
-        int16_t angle_i = (int16_t)ti[1] - 0x80;                 // 이 타겟의 각도
-        int16_t abs_angle_i = (angle_i < 0) ? -angle_i : angle_i;  // 각도의 절대값 (0도=정면에서 얼마나 벗어났는지)
-        if (abs_angle_i < best_abs_angle)                        // 지금까지 찾은 것보다 더 정면에 가까우면
+        float best_diff = 1e9f;
+        for (uint8_t i = 0; i < target_count; i++)
         {
-            best_abs_angle = abs_angle_i;                          // 최소값 갱신
-            best_idx = i;                                          // 이 타겟을 "앞차 후보"로 채택
+            const volatile uint8_t *ti = &radar_payload_buf[1 + i * RADAR_TARGET_SZ];
+            float dist_i = (float)ti[2];                        // 이 타겟의 원시 거리값(m)
+            float diff = dist_i - radar_track_distance_m;
+            if (diff < 0) diff = -diff;                          // 절대값
+            if (diff <= RADAR_TRACK_GATE_M && diff < best_diff)   // 게이트 안이면서 지금까지 중 가장 가까우면
+            {
+                best_diff = diff;
+                best_idx = i;
+            }
         }
     }
-    const volatile uint8_t *t = &radar_payload_buf[1 + best_idx * RADAR_TARGET_SZ];  // 최종 선택된(정면에 가장 가까운) 타겟 블록
+    if (best_idx == 0xFF)                                     // 연속성 있는 후보를 못 찾았으면(트랙 없음 또는 새 차) → 각도 기준 재탐색
+    {
+        int16_t best_abs_angle = 0x7FFF;
+        for (uint8_t i = 0; i < target_count; i++)
+        {
+            const volatile uint8_t *ti = &radar_payload_buf[1 + i * RADAR_TARGET_SZ];
+            int16_t angle_i = (int16_t)ti[1] - 0x80;
+            int16_t abs_angle_i = (angle_i < 0) ? -angle_i : angle_i;
+            if (abs_angle_i < best_abs_angle)
+            {
+                best_abs_angle = abs_angle_i;
+                best_idx = i;
+            }
+        }
+    }
+    const volatile uint8_t *t = &radar_payload_buf[1 + best_idx * RADAR_TARGET_SZ];  // 최종 선택된 타겟 블록
 
     uint8_t alarm_info     = t[0];                            // 경보정보 (0x01 = 접근중 알람) — 지금은 참고용
     int16_t angle_raw      = (int16_t)t[1] - 0x80;             // 각도 = 원시값 - 0x80 (문서 기준 오프셋 인코딩)
@@ -813,11 +853,31 @@ void ParseRadarFrame(void)
     uint8_t speed_raw      = t[4];                              // 속도(km/h, 최대 120)
     uint8_t snr            = t[5];                              // 신호대잡음비(0~255) — 지금은 안 쓰지만 나중에 신뢰도 필터링용
 
-    radar_distance_m = (float)distance_m_raw;                  // 거리를 그대로 float로 저장 (미터 단위)
-    radar_speed_kmh  = (speed_dir == 0x01) ? -(float)speed_raw : (float)speed_raw;
+    radar_track_distance_m = (float)distance_m_raw;            // ★추가: 다음 프레임 연속성 판단 기준으로 "이번에 고른 원시 거리"를 저장
+
+    float raw_distance_m = (float)distance_m_raw;
+    float raw_speed_kmh  = (speed_dir == 0x01) ? -(float)speed_raw : (float)speed_raw;
                                                                   // 접근중(가까워짐)이면 음수, 멀어지면 양수로 부호 통일
                                                                   // (UpdateFrontCarSpeed에서 "양수=멀어짐" 가정과 맞춤)
-    radar_angle_deg  = (int8_t)angle_raw;                       // 각도 저장
+
+    // ★추가: median-of-3 스무딩 — 센서 자체의 ±1~2m/±수km/h 노이즈로 인해 값이 자잘하게 떨리는 것을 완화
+    // (완전히 다른 물체로 튀는 문제는 위의 트랙 연속성 로직이 막아주고, 이건 그 다음 단계의 잔여 노이즈 제거용)
+    radar_dist_hist[radar_hist_idx]  = raw_distance_m;
+    radar_speed_hist[radar_hist_idx] = raw_speed_kmh;
+    radar_hist_idx = (radar_hist_idx + 1) % 3;
+    if (radar_hist_count < 3) radar_hist_count++;
+
+    if (radar_hist_count < 3)                                  // 아직 3개 안 모였으면(막 시작/트랙 재시작 직후) 최신값 그대로 사용
+    {
+        radar_distance_m = raw_distance_m;
+        radar_speed_kmh  = raw_speed_kmh;
+    }
+    else                                                        // 3개 모이면 median 사용 — 순간 튀는 값 1개는 자동으로 무시됨
+    {
+        radar_distance_m = Median3(radar_dist_hist[0], radar_dist_hist[1], radar_dist_hist[2]);
+        radar_speed_kmh  = Median3(radar_speed_hist[0], radar_speed_hist[1], radar_speed_hist[2]);
+    }
+    radar_angle_deg  = (int8_t)angle_raw;                       // 각도 저장 (스무딩 없이 그대로 — 표시/게이팅용으로만 쓰여서 큰 영향 없음)
 
     (void)alarm_info; (void)snr;                                // 아직 안 쓰는 값들이라 컴파일 경고 방지용으로 캐스팅
     // ★제거: 프레임 파싱 성공시 삑거리던 테스트용 부저 삭제함 (검증 끝났고, UpdateAnomalyJudgement()가 실제 이상감지 부저를 담당하므로 여기서 건드리면 소리가 겹침)

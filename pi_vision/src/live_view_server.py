@@ -36,7 +36,7 @@ HTML_PAGE = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h2>SecondEye - 카메라 실시간 확인 (0.5초마다 갱신)</h2>
+  <h2>SecondEye - 카메라 실시간 확인 (0.15초마다 갱신)</h2>
   <img id="frame" src="/frame.jpg">
   <div id="ts"></div>
   <script>
@@ -45,7 +45,7 @@ HTML_PAGE = """<!DOCTYPE html>
       img.src = '/frame.jpg?t=' + Date.now();   // 캐시 방지용으로 매번 다른 주소로 요청
       document.getElementById('ts').innerText = '마지막 갱신: ' + new Date().toLocaleTimeString();
     }
-    setInterval(refresh, 500);   // 0.5초마다 새로고침
+    setInterval(refresh, 150);   // ★변경: 0.5초→0.15초 (taillight_detection_test.py의 SAVE_EVERY_N_FRAMES도 5→2로 같이 낮춤)
   </script>
 </body>
 </html>
