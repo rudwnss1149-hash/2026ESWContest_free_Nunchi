@@ -126,6 +126,11 @@ volatile float pi_brightness_delta = 0.0f; // Pi가 보내준 밝기 델타값 (
 volatile uint8_t pi_anomaly_flag = 0;      // Pi가 보내준 이상여부 (0=정상, 1=이상)
 volatile uint8_t pi_data_valid = 0;        // Pi로부터 유효한 데이터를 받은 적 있는지 (아직 한 번도 못 받았으면 0)
 uint32_t last_pi_send_tick = 0;            // STM32가 Pi한테 마지막으로 데이터 보낸 시각(ms) 기록용
+// ★추가: Pi가 실시간으로 보내는 "지금 카메라가 차를 검출했는지" 상태 (이상감지 로직과는 무관, LCD 표시 전용)
+volatile uint8_t cam_detected = 0;         // 0=미검출(또는 아직 한 번도 못 받음), 1=검출됨
+// ★추가(디버그용): Pi<->STM32 통신이 실제로 되고 있는지 눈으로 확인하기 위한 카운터
+volatile uint32_t pi_total_lines = 0;      // USART2로 완성된 줄을 총 몇 개나 받았는지 (B, C, 뭐든 상관없이 다 셈)
+volatile uint32_t pi_cam_msgs = 0;         // 그중 "C," 파싱에 성공한 횟수
 // ===== 판정 로직(이상감지) 관련 =====
 #define SPEED_HISTORY_LEN 10                // 앞차 절대속도 이력을 몇 개까지 저장할지 (최근 몇 번의 측정값)
 typedef struct {                            // 속도 측정값 하나를 저장하는 구조체 (값+측정시각을 묶어서 관리)
@@ -164,6 +169,7 @@ void RadarProcessByte(uint8_t b);          // ★추가: 레이더 바이트 하
 void RadarProcessDmaBuffer(void);          // ★추가: DMA 순환버퍼에 새로 쌓인 바이트들을 꺼내 처리하는 함수 선언
 void Pi_SendRadarData(void);                // STM32가 Pi에게 레이더 데이터(거리, 상대속도)를 보내는 함수
 int Pi_ParseBrightnessResponse(const char *raw);  // Pi가 보낸 응답 문자열을 파싱하는 함수
+int Pi_ParseCameraStatus(const char *raw);          // ★추가: Pi가 보낸 "C,검출여부" 응답을 파싱하는 함수
 void UpdateFrontCarSpeed(void);             // 레이더+내차속도를 결합해서 앞차 절대속도를 계산하고 이력에 저장하는 함수
 uint8_t CheckDeceleration(void);            // 최근 이력을 보고 "지금 감속 중인지" 판정하는 함수
 void UpdateAnomalyJudgement(void);          // 감속여부+밝기이상여부를 종합해서 최종 이상감지 판정을 내리는 함수
@@ -266,7 +272,18 @@ int main(void)
           }
           if (pi_line_ready)                                      // Pi로부터 한 줄(응답)이 다 도착했으면
           {
-              Pi_ParseBrightnessResponse((const char*)pi_rx_line); // 그 응답을 파싱해서 pi_brightness_delta, pi_anomaly_flag에 저장 (★검증 끝: STM32<->Pi B, 파싱 정상 확인됨)
+              pi_total_lines++;                                   // ★추가(디버그용): 뭐가 됐든 한 줄 받을 때마다 카운트
+              // ★변경: Pi가 이제 두 종류의 메시지를 보냄 → 첫 글자로 구분해서 처리
+              //   "B,..." = 밝기델타/이상여부 (기존, 이상감지 로직에 실제로 쓰임)
+              //   "C,..." = 지금 카메라가 차를 검출했는지 여부 (★추가, LCD 표시 전용, 판정 로직엔 영향 없음)
+              if (pi_rx_line[0] == 'B')
+              {
+                  Pi_ParseBrightnessResponse((const char*)pi_rx_line); // 그 응답을 파싱해서 pi_brightness_delta, pi_anomaly_flag에 저장 (★검증 끝: STM32<->Pi B, 파싱 정상 확인됨)
+              }
+              else if (pi_rx_line[0] == 'C')
+              {
+                  Pi_ParseCameraStatus((const char*)pi_rx_line);       // ★추가: 카메라 검출상태 파싱해서 cam_detected에 저장
+              }
               pi_line_ready = 0;                                  // 처리 끝났으니 깃발 내림
               pi_rx_index = 0;                                    // 다음 줄 받을 준비
           }
@@ -740,6 +757,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             {
                 pi_rx_line[pi_rx_index] = '\0';  // 문자열 끝에 널문자 추가
                 pi_line_ready = 1;            // 한 줄 완성 깃발 올림
+                pi_rx_index = 0;              // ★추가: 메인루프가 아직 이 줄을 처리 못했더라도, 다음 줄은 무조건 처음부터 새로 채우게 함
+                                               // (예전엔 메인루프가 처리한 뒤에야 0으로 리셋해서, 그 사이에 새 메시지가 들어오면
+                                               //  이전 메시지 뒤에 이어붙으면서 내용이 깨지는 문제가 있었음 — 지금처럼 Pi가
+                                               //  "B,"와 "C," 메시지를 빠르게 연달아 보낼 때 특히 자주 발생했을 것으로 추정)
             }
         }
         else if (pi_rx_index < PI_RX_LINE_MAX - 1)  // 버퍼에 공간 남아있으면
@@ -767,9 +788,23 @@ void ParseRadarFrame(void)
     uint16_t expected_len = 1 + (uint16_t)target_count * RADAR_TARGET_SZ;
     if (expected_len > radar_payload_len) return;            // 길이가 안 맞으면(깨진 데이터일 가능성) 그냥 무시하고 종료
 
-    // TODO: 타겟이 여러 개일 때 "앞차"를 어떻게 고를지(가장 가까운 것? 정면에 가까운 각도?) 정책 확정 필요
-    // 일단은 첫 번째 타겟(payload_buf[1]부터 시작하는 6바이트 블록)을 앞차로 취급
-    const volatile uint8_t *t = &radar_payload_buf[1];       // 첫 번째 타겟 블록의 시작 위치를 가리키는 포인터
+    // ★변경: 실차 테스트 결과 "항상 첫 번째 타겟" 방식은 거리값이 프레임마다 심하게 튀는 문제가 있었음
+    // (옆차선 차/가드레일 등 다른 물체가 매 프레임 타겟 순서를 바꿔가며 1번 자리를 차지했던 것으로 추정)
+    // → 여러 타겟 중 "각도가 정면(0도)에 가장 가까운 것"을 앞차로 선택하도록 변경 (내 차 앞에 있는 차라면 각도가 0에 가까울 것이라는 가정)
+    uint8_t best_idx = 0;                                     // 지금까지 찾은 것 중 정면에 가장 가까운 타겟의 인덱스
+    int16_t best_abs_angle = 0x7FFF;                          // 지금까지 찾은 최소 |각도| (처음엔 매우 큰 값으로 초기화해서 첫 타겟이 무조건 갱신되게 함)
+    for (uint8_t i = 0; i < target_count; i++)                // 이번 프레임에 있는 모든 타겟을 순회
+    {
+        const volatile uint8_t *ti = &radar_payload_buf[1 + i * RADAR_TARGET_SZ];  // i번째 타겟 블록 시작 위치
+        int16_t angle_i = (int16_t)ti[1] - 0x80;                 // 이 타겟의 각도
+        int16_t abs_angle_i = (angle_i < 0) ? -angle_i : angle_i;  // 각도의 절대값 (0도=정면에서 얼마나 벗어났는지)
+        if (abs_angle_i < best_abs_angle)                        // 지금까지 찾은 것보다 더 정면에 가까우면
+        {
+            best_abs_angle = abs_angle_i;                          // 최소값 갱신
+            best_idx = i;                                          // 이 타겟을 "앞차 후보"로 채택
+        }
+    }
+    const volatile uint8_t *t = &radar_payload_buf[1 + best_idx * RADAR_TARGET_SZ];  // 최종 선택된(정면에 가장 가까운) 타겟 블록
 
     uint8_t alarm_info     = t[0];                            // 경보정보 (0x01 = 접근중 알람) — 지금은 참고용
     int16_t angle_raw      = (int16_t)t[1] - 0x80;             // 각도 = 원시값 - 0x80 (문서 기준 오프셋 인코딩)
@@ -791,8 +826,9 @@ void ParseRadarFrame(void)
 void Pi_SendRadarData(void)
 {
     char msg[48];                            // 보낼 메시지를 담을 임시 문자 배열
-    int len = snprintf(msg, sizeof(msg), "R,%.1f,%.1f\r\n", radar_distance_m, radar_speed_kmh);
-    // "R,거리,상대속도\r\n" 형식의 문자열을 만듦, snprintf는 printf처럼 포맷팅해서 문자열로 만들어줌
+    // ★변경: 각도값도 같이 보내줌 (Pi에서 레이더 각도 → 카메라 화면 픽셀 위치로 변환해서 ROI를 좁히는 데 씀)
+    int len = snprintf(msg, sizeof(msg), "R,%.1f,%.1f,%d\r\n", radar_distance_m, radar_speed_kmh, (int)radar_angle_deg);
+    // "R,거리,상대속도,각도\r\n" 형식의 문자열을 만듦, snprintf는 printf처럼 포맷팅해서 문자열로 만들어줌
     // %.1f는 소수점 첫째자리까지 표시하라는 뜻
     HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 100);  // USART2로 그 문자열 전송, 타임아웃 100ms
 }
@@ -816,6 +852,24 @@ int Pi_ParseBrightnessResponse(const char *raw)
     pi_anomaly_flag = (uint8_t)anomaly_val;  // 이상여부도 전역변수에 저장
     pi_data_valid = 1;                       // "유효한 Pi 데이터를 받은 적 있다"고 표시
     return 0;                                // 성공 반환
+}
+// ★추가: Pi가 매 프레임 보내는 "C,검출여부"(지금 카메라가 차를 보고 있는지)를 파싱하는 함수
+// (이상감지 판정 로직에는 전혀 관여하지 않고, LCD 표시 전용으로만 씀)
+int Pi_ParseCameraStatus(const char *raw)
+{
+    if (raw[0] != 'C' || raw[1] != ',')     // "C,"로 시작하지 않으면 형식 에러
+    {
+        return -1;
+    }
+    int detected_val;                        // 파싱될 검출여부(0/1)
+    int parsed = sscanf(raw + 2, "%d", &detected_val);
+    if (parsed != 1)
+    {
+        return -1;
+    }
+    cam_detected = (uint8_t)detected_val;    // 전역변수에 저장 (LCD_UpdateStatus에서 표시함)
+    pi_cam_msgs++;                           // ★추가(디버그용): C, 파싱 성공 횟수 카운트
+    return 0;
 }
 // 레이더의 상대속도 + 내 차 절대속도(ELM327)를 결합해서 앞차 절대속도를 계산하고 이력에 저장하는 함수
 void UpdateFrontCarSpeed(void)
@@ -1142,6 +1196,8 @@ void LCD_UpdateStatus(void)
     char line1[16];    // "D:123.4M" 같은 거리/속도 정보 한 줄
     char line2[8];     // "WARN" 또는 "OK  " 경고상태 한 줄
     char line3[16];    // ★추가(디버그용): ELM327 연결여부 + 감속판정여부 표시
+    char line4[16];    // ★추가: 지금 이 순간 카메라가 차량을 검출하고 있는지 실시간 표시
+    char line5[24];    // ★추가(디버그용): Pi<->STM32 통신 카운터 (총 수신 줄 수 / C, 파싱 성공 수)
 
     if (radar_distance_m < 0)                                     // 아직 유효한 레이더 타겟이 없으면
     {
@@ -1176,6 +1232,16 @@ void LCD_UpdateStatus(void)
     //                  + 지금 감속판정 상태(DECEL=감속중/------ =아니오) 를 작게 표시
     snprintf(line3, sizeof(line3), "E:%c %s", elm_data_valid ? 'C' : 'L', is_decelerating ? "DECEL" : "-----");
     LCD_DrawString(10, 160, line3, 0xFFE0, 0x0000, 2);             // 노란 글씨, 검정 배경, 2배 확대(작게, 디버그용이니 방해 안 되게)
+
+    // ★추가: 지금 이 순간 카메라(Pi/YOLO)가 차량을 검출하고 있는지 실시간 표시
+    // (CAM:D = 검출됨, CAM:- = 미검출 — Pi가 매 프레임 "C," 메시지로 계속 갱신해줌)
+    snprintf(line4, sizeof(line4), "CAM:%c", cam_detected ? 'D' : '-');
+    uint16_t cam_color = cam_detected ? 0x07E0 : 0xF800;           // 검출되면 초록, 미검출이면 빨강
+    LCD_DrawString(10, 190, line4, cam_color, 0x0000, 2);
+
+    // ★추가(디버그용): Pi<->STM32 통신이 실제로 되고 있는지 확인용 카운터 (원인 파악 끝나면 나중에 지워도 됨)
+    snprintf(line5, sizeof(line5), "L:%lu C:%lu", (unsigned long)pi_total_lines, (unsigned long)pi_cam_msgs);
+    LCD_DrawString(10, 215, line5, 0x07FF, 0x0000, 2);              // 하늘색 글씨
 }
 /* USER CODE END 4 */
 

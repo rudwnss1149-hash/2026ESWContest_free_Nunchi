@@ -1,0 +1,11 @@
+# SecondEye - Pi 쪽 파이썬 패키지 목록
+# ★중요: YOLO 방식을 버리고 ROI+redness 방식으로 전환하면서 ultralytics/torch가 더 이상 필요 없어짐!
+#        (torch는 ~150MB라 예전 설치 때 네트워크 오류의 주범이었음 — 이번 재설치는 훨씬 빠르고 가벼울 것)
+#
+# 설치 방법 (Pi에서, venv 활성화 후):
+#   pip install -r requirements.txt --break-system-packages
+#   (또는 venv 안이면 --break-system-packages 없이: pip install -r requirements.txt)
+
+opencv-python-headless    # cv2 - 영상처리 (headless 버전 권장: GUI 의존성 없어서 Pi에서 더 가볍고 빠르게 설치됨)
+numpy                     # 배열/수치 연산
+pyserial                  # STM32와 UART 시리얼 통신 (import serial)

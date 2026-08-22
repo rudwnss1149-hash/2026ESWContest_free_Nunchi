@@ -1,16 +1,45 @@
 """
-YOLO로 화면에서 "가장 크게(=가장 가깝게) 보이는 차"만 선택하고,
-차량 박스를 상단 비율 기준 두 구간(하이마운트 브레이크등 구간 / 좌우 후미등 구간)으로 나눈 뒤,
-각 구간 안에서만 빨간 덩어리를 찾아 밝기 변화를 감지하는 코드
-(Pi 등 화면(모니터) 없는 환경용 — cv2.imshow 대신 파일 저장 + 터미널 로그 방식)
-(속도 최적화: YOLO는 N프레임마다 한 번만 실행, 나머지는 마지막 박스 위치 재사용)
+★대폭 변경: "차를 먼저 찾고 그 안에서 브레이크등을 찾는" YOLO 기반 방식을 버리고,
+"화면의 정해진 관심영역(ROI) 안에서 빨간 덩어리를 직접 찾아 밝기변화를 감지"하는 방식으로 전환.
 
-===== ★STM32 통신 프로토콜 추가됨 =====
-- STM32가 200ms마다 USART2로 보내는 "R,거리,상대속도\r\n"을 백그라운드 스레드로 계속 읽어서
-  latest_radar_distance / latest_radar_speed 전역변수에 저장해둠 (지금 당장 이 스크립트에서 안 써도,
-  나중에 "차가 감속중인데 카메라 프레임엔 아직 없다" 같은 조합판단 하려면 필요해서 미리 받아둠)
+왜 바꿨나:
+- 실제 도로 거리에서는 앞차가 화면에 너무 작게 잡혀서 YOLO가 차량 자체를 인식 못하는 문제가 계속 있었음
+- 근데 우리한테 진짜 필요한 건 "차량 인식"이 아니라 "앞차 후미등 영역에서 밝기가 급격히 늘었는가"뿐임
+- 차 전체를 인식할 필요 없이, 카메라가 정면 고정이라 앞차는 대략 화면 중앙 부근에 있을 거라는 전제로
+  그 구역(ROI)만 보고 빨간 덩어리 찾으면 훨씬 작은 물체도 잡을 수 있고, YOLO 추론 자체가 없어져서 훨씬 빠름
+
+측정 방식:
+- 밝기값은 단순 R채널 평균이 아니라 "redness = R - (G+B)/2" (빨간정도)로 계산
+  → 헤드라이트나 전체적인 노출변화(흰 빛)로 화면이 밝아지는 것과, 실제 빨간 브레이크등이 켜지는 걸 더 잘 구분함
+- ON/OFF 판정은 시작할 때(30프레임째) 자동으로 잡은 "장기 기준값(baseline)"과 비교함
+  (프레임 간 순간 변화량만 보면, 브레이크등이 몇 초씩 계속 켜져있을 때 "꺼졌다"고 착각하는 문제가 있어서
+   장기 기준값 방식을 그대로 유지함 — 대신 blob "위치를 찾는" 단계에서는 HSV 빨간색 검출을 그대로 씀)
+
+(Pi 등 화면(모니터) 없는 환경용 — cv2.imshow 대신 파일 저장 + 터미널 로그 방식)
+
+===== ★변경(v2): 레이더는 "화면을 좁게 자르는 용도"가 아니라 "여러 후보 중 고르는 힌트"로만 씀 =====
+(1차 버전은 레이더 각도로 스캔 범위 자체를 좁혔었는데, 레이더 자체도 100% 안정적이지 않다는 우려가 있어서
+ 더 보수적인 방식으로 바꿈 — "레이더가 틀려도 최소한 지금 방식(고정 ROI 넓게 스캔)보다는 절대 나빠지지 않게")
+
+동작 방식:
+- 카메라 스캔 범위(ROI)는 항상 고정 넓은 영역(ROI_X1~X2, Y1~Y2) 그대로 유지함 — 레이더 상태와 무관하게
+  "혹시 놓치는 일"이 없도록 하는 안전판. 레이더가 죽어도 이 스캔 자체는 절대 안 좁아짐
+- 레이더가 "신선하고(RADAR_STALE_TIMEOUT_SEC 이내) + 최근 N개 연속 유효 샘플(RADAR_MIN_SAMPLES)"을
+  만족할 때만 "신뢰 가능"으로 보고, 그 여러 샘플의 중앙값(median)을 써서 노이즈(한 프레임 튐)를 걸러냄
+  → 단순 이동평균이 아니라 median을 쓰는 이유: 평균은 한 번 크게 튄 값에도 끌려가지만 median은 안 끌려감
+- 레이더가 신뢰 가능하면: ROI 안에서 찾은 여러 빨간 블롭 중, 레이더가 가리키는 위치 근처(RADAR_GATE_HALF_WIDTH_RATIO)에
+  있는 것들만 골라서 밝기 계산에 씀 (손/가로등/옆차선 후미등처럼 레이더 위치와 무관한 블롭은 자동 제외)
+- 근데 만약 레이더가 가리키는 위치 근처에 빨간 블롭이 하나도 없으면(레이더와 카메라가 서로 다른 얘기를 하는 상황
+  = 레이더가 순간적으로 틀렸거나, 실제로 그 위치에 빨간불이 없거나) → 그 프레임은 레이더를 무시하고
+  ROI 안의 모든 블롭을 그대로 씀 (기존 방식과 동일) → 레이더가 틀려도 신호를 완전히 놓치지는 않음
+- 레이더 신호 자체가 없거나(거리=-1) 오래됐거나 샘플이 부족하면 애초에 게이팅을 안 하고 항상 전체 블롭 사용
+
+===== STM32 통신 프로토콜 =====
+- STM32가 200ms마다 USART2로 보내는 "R,거리,상대속도,각도\r\n"을 백그라운드 스레드로 계속 읽어서
+  latest_radar_distance / latest_radar_speed / latest_radar_angle 전역변수 + radar_angle_history(최근 N개)에 저장해둠
 - 베이스라인이 설정된 이후, 밝기 델타를 계산할 때마다 "B,밝기델타,이상여부\r\n"을 STM32로 전송함
   (이상여부: delta가 임계값보다 크면 1=밝아짐 감지됨(정상적으로 브레이크등 켜짐), 아니면 0=변화없음)
+- 매 프레임(200ms 속도제한 적용) "C,검출여부\r\n"도 전송함 (LCD 실시간 표시 전용, 판정 로직과 무관)
 
 사용법: python src/taillight_detection_test.py
    Ctrl+C: 종료
@@ -18,56 +47,91 @@ YOLO로 화면에서 "가장 크게(=가장 가깝게) 보이는 차"만 선택�
 import cv2
 import numpy as np
 import time
+import math                                          # 레이더-카메라 위치 차이를 보정하는 삼각함수 계산용 (atan2, sin, cos)
+import statistics                                    # 레이더 각도의 median(중앙값) 계산용 — 한 프레임 튀는 값에 안 끌려가게
 from collections import deque
-from ultralytics import YOLO
-import serial                                        # ★추가: STM32와 시리얼(UART) 통신을 하기 위한 라이브러리
-import threading                                     # ★추가: 시리얼 읽기를 메인 영상처리 루프와 분리된 스레드로 돌리기 위함
+import serial                                        # STM32와 시리얼(UART) 통신을 하기 위한 라이브러리
+import threading                                     # 시리얼 읽기를 메인 영상처리 루프와 분리된 스레드로 돌리기 위함
 
 SMOOTHING_FRAMES = 5
-DELTA_THRESHOLD = 15.0
-MIN_RED_PIXELS = 15
+DELTA_THRESHOLD = 15.0          # 이 값(redness 기준) 이상 밝아지면 "브레이크등 켜짐"으로 판정
+MIN_RED_PIXELS = 8              # ★변경: 멀리 있는 작은 빛도 잡아야 하니 기존(15)보다 낮춤
 PADDING = 5
-MIN_CAR_AREA_RATIO = 0.02
-HIGHMOUNT_TOP = 0.00
-HIGHMOUNT_BOTTOM = 0.15
-TAILLIGHT_TOP = 0.35
-TAILLIGHT_BOTTOM = 0.55
 SAVE_EVERY_N_FRAMES = 5
 BASELINE_AT_FRAME = 30
-YOLO_INTERVAL = 8
-YOLO_IMGSZ = 320
+
+# ===== ★추가: 관심영역(ROI) 설정 — 화면 전체가 아니라 이 구역 안에서만 빨간 덩어리를 찾음 =====
+# 카메라가 차량 정면 고정이라, 내 차선 앞차는 대략 이 범위 안에 있을 거라는 전제
+# (실제로 카메라 붙여놓은 각도 보면서 미세조정 필요 — 조정하고 싶으면 이 4개 비율만 바꾸면 됨)
+ROI_X1_RATIO = 0.20   # 왼쪽 경계 (화면 가로의 20% 지점부터)
+ROI_X2_RATIO = 0.80   # 오른쪽 경계 (화면 가로의 80% 지점까지)
+ROI_Y1_RATIO = 0.30   # 위쪽 경계 (하늘/윗부분 제외)
+ROI_Y2_RATIO = 0.90   # 아래쪽 경계 (내 차 보닛/대시보드 제외)
+MAX_BLOBS_IN_ROI = 3    # ROI 안에서 최대 몇 개의 빨간 덩어리까지 고려할지 (그중 밝기 평균 큰 것들 위주로 씀)
+
+# ===== ★변경(v2): 레이더는 ROI를 좁히는 게 아니라, 찾은 블롭 중 "이게 진짜다" 골라주는 힌트로만 씀 =====
+CAMERA_HFOV_DEG = 60.0             # 웹캠의 대략적인 수평 화각(도) — 실측값 아니면 일반 웹캠 평균치로 가정, 나중에 실측해서 조정 필요
+RADAR_GATE_HALF_WIDTH_RATIO = 0.20   # 레이더가 가리키는 위치 기준, 화면 가로폭의 ±몇 % 안에 있는 블롭까지 "레이더와 일치"로 볼지
+RADAR_STALE_TIMEOUT_SEC = 1.0      # 이 시간 이상 레이더 갱신이 없으면 "레이더 없음"으로 보고 게이팅 안 함
+RADAR_ANGLE_HISTORY_LEN = 5        # 각도 median 계산에 쓸 최근 샘플 개수
+RADAR_MIN_SAMPLES = 3              # 이 개수 이상 연속 유효 샘플이 쌓여야 레이더를 신뢰함 (막 재연결된 직후 튀는 값 방지용 디바운스)
+RADAR_ANGLE_SIGN = 1.0              # ★실측 전 임시값: 레이더 각도의 +/-가 실제 왼쪽/오른쪽 중 어느 쪽인지 아직 확인 안 됨
+                                     # (실차에서 확인해서 반대면 -1.0으로 바꾸면 됨)
+
+# ===== ★추가: 레이더-카메라 실측 장착 위치 차이 보정용 (2026-08-22 실측값) =====
+# 레이더 = 쏘렌토 앞 그릴 중앙(기아 엠블럼 부근), 카메라 = 실내 룸미러(정중앙에서 조수석 방향 30cm),
+# 카메라가 레이더보다 차량 뒤쪽으로 약 1.8~1.9m 떨어져 있음 (앞뒤 거리 차이가 좌우 매핑에 미치는 영향 보정)
+# (높이 차이는 무시함 — 지금은 좌우 픽셀 위치만 계산하므로 상하 위치 차이는 이 계산에 영향 없음)
+RADAR_TO_CAM_FORWARD_OFFSET_M = 1.85   # 카메라가 레이더보다 뒤쪽에 있는 거리(m) — 1.8~1.9m의 평균값
+RADAR_TO_CAM_LATERAL_OFFSET_M = 0.30   # 카메라가 레이더 중심선보다 조수석 방향으로 치우친 거리(m)
+
+# 캡처 해상도를 미리 높여서 요청함 (웹캠이 지원하면). 원본 해상도가 높아야 작은 빛도 디테일이 살아있음
+CAPTURE_WIDTH = 1280
+CAPTURE_HEIGHT = 720
+WORK_WIDTH = 640    # 실제 처리(빨간블롭 찾기 등)에 쓸 작업용 해상도 (너무 크면 Pi CPU 부담)
+WORK_HEIGHT = 480
 
 # ===== ★STM32 시리얼 통신 설정 =====
 STM32_PORT = '/dev/serial0'                         # 라즈베리파이의 GPIO UART 포트 (STM32 USART2와 연결된 핀)
                                                      # 안 열리면 '/dev/ttyAMA0'으로도 시도해볼 것 (Pi 설정에 따라 이름 다를 수 있음)
 STM32_BAUD = 115200                                 # STM32의 huart2 baudrate와 반드시 동일해야 함 (main.c MX_USART2_UART_Init 참고)
+STM32_SEND_INTERVAL_SEC = 0.2   # B,/C, 메시지를 STM32로 보내는 최소 간격 (STM32 쪽 200ms 루프주기와 맞춤, 수신버퍼 보호용)
 
-latest_radar_distance = None                        # ★STM32가 보내준 최신 레이더 거리값(m) 저장, 아직 안 받았으면 None
-latest_radar_speed = None                           # ★STM32가 보내준 최신 상대속도값(km/h) 저장
-serial_data_lock = threading.Lock()                 # ★백그라운드 스레드랑 메인루프가 동시에 위 두 변수를 건드리지 않도록 보호하는 락
+latest_radar_distance = None                        # STM32가 보내준 최신 레이더 거리값(m) 저장, 아직 안 받았으면 None
+latest_radar_speed = None                           # STM32가 보내준 최신 상대속도값(km/h) 저장
+latest_radar_angle = None                           # STM32가 보내준 최신 레이더 각도값(도, 정면=0) 저장 (화면 표시/로그용, 단일값이라 노이즈 있음)
+latest_radar_update_time = 0.0                      # 마지막으로 "유효한"(distance>=0) 레이더 데이터를 받은 시각
+radar_angle_history = deque(maxlen=RADAR_ANGLE_HISTORY_LEN)  # ★추가: 최근 유효 각도값들 — median 계산해서 노이즈 억제하는 데 씀
+serial_data_lock = threading.Lock()                 # 백그라운드 스레드랑 메인루프가 동시에 위 변수들을 건드리지 않도록 보호하는 락
 
-print("[YOLO] 모델 로딩 중... (최초 실행시 다운로드 때문에 몇 분 걸릴 수 있음)")
-model = YOLO('yolov8n.pt')
-print("[YOLO] 모델 로딩 완료")
 
-
-def stm32_serial_reader(ser):                       # ★STM32에서 오는 "R,거리,속도" 줄을 계속 읽어서 전역변수에 저장하는 함수 (별도 스레드에서 실행됨)
-    global latest_radar_distance, latest_radar_speed   # 함수 안에서 전역변수를 수정하겠다고 선언
+def stm32_serial_reader(ser):                       # STM32에서 오는 "R,거리,속도,각도" 줄을 계속 읽어서 전역변수에 저장하는 함수 (별도 스레드에서 실행됨)
+    global latest_radar_distance, latest_radar_speed, latest_radar_angle, latest_radar_update_time   # 함수 안에서 전역변수를 수정하겠다고 선언
     while True:                                          # 프로그램이 끝날 때까지 무한 반복
         try:                                               # 시리얼 읽기 중 에러가 나도 스레드가 죽지 않게 감싸줌
             raw_line = ser.readline()                        # 한 줄(개행까지) 읽기 시도, timeout 설정에 따라 없으면 빈 값 반환하고 넘어감
             if not raw_line:                                  # 아무것도 못 읽었으면(타임아웃)
                 continue                                        # 그냥 다음 반복으로 (에러 아님, 정상적인 대기)
             line = raw_line.decode('utf-8', errors='ignore').strip()  # 바이트를 문자열로 변환, 앞뒤 공백/개행 제거
-            if line.startswith('R,'):                          # STM32가 보내는 레이더 데이터 형식("R,거리,속도")이면
-                parts = line.split(',')                          # 쉼표 기준으로 쪼갬 → ["R", "거리", "속도"]
-                if len(parts) == 3:                               # 정확히 3개로 쪼개졌으면(형식이 맞으면)
+            if line.startswith('R,'):                          # STM32가 보내는 레이더 데이터 형식("R,거리,속도,각도")이면
+                parts = line.split(',')                          # 쉼표 기준으로 쪼갬 → ["R", "거리", "속도", "각도"]
+                # ★변경: 각도값이 추가돼서 이제 4개로 쪼개짐. 구버전 펌웨어(3개)도 혹시 몰라 하위호환으로 처리
+                if len(parts) >= 3:                               # 최소 거리/속도까지는 있어야 함
                     try:                                            # 숫자 변환 실패(깨진 데이터 등) 대비
                         dist = float(parts[1])                        # 두 번째 조각을 거리값(실수)으로 변환
                         spd = float(parts[2])                         # 세 번째 조각을 속도값(실수)으로 변환
+                        ang = float(parts[3]) if len(parts) >= 4 else None  # 네 번째 조각(각도)이 있으면 변환, 없으면 None
                         with serial_data_lock:                        # 락을 잡은 상태에서만 전역변수 수정(동시접근 방지)
+                            # ★추가: 이전 유효 데이터로부터 시간이 너무 많이 지났으면(끊겼다 재연결 등)
+                            # 과거 각도 이력을 그대로 이어붙이면 median이 옛날 값에 끌려갈 수 있으니 이력을 비우고 새로 시작
+                            if (time.time() - latest_radar_update_time) > RADAR_STALE_TIMEOUT_SEC:
+                                radar_angle_history.clear()
                             latest_radar_distance = dist                # 최신 거리값 갱신
                             latest_radar_speed = spd                    # 최신 속도값 갱신
+                            latest_radar_angle = ang                    # 최신 각도값 갱신 (표시용)
+                            if dist >= 0 and ang is not None:             # 진짜 유효한 타겟일 때만(거리=-1은 "타겟 없음") 이력에 반영
+                                radar_angle_history.append(ang)
+                                latest_radar_update_time = time.time()     # 갱신 시각 기록 (stale/게이팅 판단용)
                     except ValueError:                               # 숫자로 변환이 안 되면(깨진 줄)
                         pass                                            # 그냥 무시하고 다음 줄 기다림
         except Exception as e:                                    # 시리얼 포트 자체에 문제가 생기면(케이블 빠짐 등)
@@ -76,6 +140,8 @@ def stm32_serial_reader(ser):                       # ★STM32에서 오는 "R,�
 
 
 def find_red_blobs(frame, region, max_blobs):
+    # HSV 색공간에서 "빨간색"에 해당하는 픽셀들을 찾아서, 덩어리(블롭)로 묶어 위치를 찾는 함수
+    # (0~10도, 160~180도 두 구간을 OR로 합치는 이유: HSV에서 빨간색은 색상환의 양 끝에 걸쳐있기 때문)
     x1, y1, x2, y2 = region
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = int(x2), int(y2)
@@ -83,9 +149,11 @@ def find_red_blobs(frame, region, max_blobs):
     if crop.size == 0:
         return []
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    lower_red1 = np.array([0, 100, 100])
+    # ★변경: 채도(S) 하한을 100→130으로 올림 — 손/피부색처럼 채도가 낮은 "옅은 빨강/핑크"는 걸러내고,
+    # 브레이크등처럼 채도가 높은(진짜 진한 빨강) 빛만 남기려는 목적
+    lower_red1 = np.array([0, 130, 100])
     upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([160, 100, 100])
+    lower_red2 = np.array([160, 130, 100])
     upper_red2 = np.array([180, 255, 255])
     mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
     mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
@@ -115,50 +183,97 @@ def find_red_blobs(frame, region, max_blobs):
     return results
 
 
-def get_search_regions(car_box):
-    x1, y1, x2, y2 = car_box
-    box_height = y2 - y1
-    highmount_region = (
-        x1, y1 + box_height * HIGHMOUNT_TOP,
-        x2, y1 + box_height * HIGHMOUNT_BOTTOM
-    )
-    taillight_region = (
-        x1, y1 + box_height * TAILLIGHT_TOP,
-        x2, y1 + box_height * TAILLIGHT_BOTTOM
-    )
-    return highmount_region, taillight_region
-
-
-def get_red_brightness(frame, roi):
+def get_redness(frame, roi):
+    # ★변경: 단순 R채널 평균 대신 "redness = R - (G+B)/2"를 씀
+    # → 전체 화면이 밝아지는 것(헤드라이트, 노출변화)과 실제 빨간 브레이크등이 켜지는 걸 더 잘 구분함
     x1, y1, x2, y2 = roi
     x1, y1 = max(0, x1), max(0, y1)
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return None
-    b, g, r = cv2.split(crop)
-    return float(np.mean(r))
+    b, g, r = cv2.split(crop.astype(np.int16))   # int16으로 변환 (뺄셈 중 음수/오버플로 방지)
+    redness = r - (g + b) / 2.0
+    redness = np.clip(redness, 0, None)          # 음수(빨간색이 아닌 부분)는 0으로 클리핑
+    return float(np.mean(redness))
 
 
-def process_taillights(frame, car_box):
-    x1, y1, x2, y2 = car_box
-    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 1)
-    highmount_region, taillight_region = get_search_regions((x1, y1, x2, y2))
-    hx1, hy1, hx2, hy2 = [int(v) for v in highmount_region]
-    cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 200, 200), 1)
-    tx1, ty1, tx2, ty2 = [int(v) for v in taillight_region]
-    cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), (200, 200, 0), 1)
-    highmount_blobs = find_red_blobs(frame, highmount_region, max_blobs=1)
-    taillight_blobs = find_red_blobs(frame, taillight_region, max_blobs=2)
-    all_blobs = highmount_blobs + taillight_blobs
-    brightness_values = []
-    for (bx1, by1, bx2, by2) in all_blobs:
-        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
-        b = get_red_brightness(frame, (bx1, by1, bx2, by2))
-        if b is not None:
-            brightness_values.append(b)
-    if brightness_values:
-        return float(np.mean(brightness_values)), len(all_blobs)
-    return None, 0
+def get_radar_target_x(w):
+    # ★추가(v2): 레이더가 "지금 신뢰할 만한지" 판단하고, 신뢰할 만하면 각도를 화면 픽셀 x좌표로 변환해서 반환.
+    # 신뢰 못 하면 None을 반환 → 호출하는 쪽(scan_roi_for_brake_light)에서 게이팅을 아예 안 하고 안전하게 넘어감
+    with serial_data_lock:
+        dist = latest_radar_distance
+        upd_time = latest_radar_update_time
+        hist = list(radar_angle_history)   # 리스트로 복사해서 락 밖에서 계산 (락 잡는 시간 최소화)
+
+    if dist is None or dist < 0:                                # 애초에 유효한 타겟이 없으면
+        return None
+    if (time.time() - upd_time) > RADAR_STALE_TIMEOUT_SEC:        # 마지막 유효 갱신이 너무 오래 전이면(연결 끊김 등)
+        return None
+    if len(hist) < RADAR_MIN_SAMPLES:                            # 아직 신뢰할 만큼 샘플이 안 쌓였으면(막 재연결된 직후 등)
+        return None
+
+    smoothed_angle = statistics.median(hist)                     # 최근 N개 중 중앙값 — 한 프레임 튀는 값에 안 끌려감
+
+    # ===== ★추가: 레이더-카메라 장착 위치 차이 보정 =====
+    # 레이더가 "각도 smoothed_angle, 거리 dist"라고 알려준 타겟 위치를, 레이더 기준 좌표계(전방=X, 우측=Y)로 먼저 바꾸고,
+    # 카메라가 레이더보다 뒤쪽/조수석쪽으로 떨어진 만큼 좌표를 옮겨서 "카메라 입장에서의 각도"로 다시 계산함
+    ang_rad = math.radians(smoothed_angle * RADAR_ANGLE_SIGN)       # 도(degree) → 라디안, 부호는 실측 전이라 RADAR_ANGLE_SIGN으로 임시 처리
+    target_x_from_radar = dist * math.cos(ang_rad)                   # 레이더 기준, 타겟까지의 전방 거리
+    target_y_from_radar = dist * math.sin(ang_rad)                   # 레이더 기준, 타겟까지의 좌우(+=조수석쪽) 거리
+    # 카메라는 레이더보다 뒤쪽에 있으므로(전방좌표 -offset), 카메라 기준 전방거리 = 타겟전방거리 + 레이더-카메라 간격
+    rel_x = target_x_from_radar + RADAR_TO_CAM_FORWARD_OFFSET_M
+    # 카메라는 레이더 중심선보다 조수석쪽으로 치우쳐 있으므로, 그만큼 빼줌
+    rel_y = target_y_from_radar - RADAR_TO_CAM_LATERAL_OFFSET_M
+    camera_angle_deg = math.degrees(math.atan2(rel_y, rel_x))        # 카메라 입장에서 본 타겟의 각도(도)
+
+    half_fov = CAMERA_HFOV_DEG / 2.0
+    offset_ratio = max(-1.0, min(1.0, camera_angle_deg / half_fov))  # -1~1로 clamp (화각 밖 각도 방지)
+    return (w / 2.0) + offset_ratio * (w / 2.0)                   # 화면 중심 기준으로 각도만큼 이동한 픽셀 x좌표
+    # ★참고: camera_angle_deg의 부호가 화면 왼쪽/오른쪽 중 어느 쪽인지, 그리고 RADAR_ANGLE_SIGN이 맞는지는
+    #        실측 전엔 확신 못 함 — 실측해서 반대로 움직이면 RADAR_ANGLE_SIGN을 -1.0으로 바꾸면 됨
+
+
+def scan_roi_for_brake_light(frame):
+    # ★변경(v2): 스캔 범위(ROI)는 항상 고정 넓은 영역 그대로 유지(레이더 죽어도 절대 안 좁아지는 안전판).
+    # 레이더가 신뢰 가능하면, 찾은 블롭들 중 레이더 위치 근처에 있는 것만 "진짜"로 골라서 씀.
+    # 레이더 위치 근처에 블롭이 하나도 없으면(레이더-카메라 불일치) → 안전하게 전체 블롭으로 폴백.
+    # (예전 process_taillights()를 대체함 — YOLO 차량박스 없이 ROI 기준으로 동작)
+    h, w = frame.shape[:2]
+    rx1 = int(w * ROI_X1_RATIO)
+    ry1 = int(h * ROI_Y1_RATIO)
+    rx2 = int(w * ROI_X2_RATIO)
+    ry2 = int(h * ROI_Y2_RATIO)
+    cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (200, 200, 0), 1)  # 고정 ROI 테두리 (항상 이 넓은 범위를 실제로 스캔함)
+
+    blobs = find_red_blobs(frame, (rx1, ry1, rx2, ry2), max_blobs=MAX_BLOBS_IN_ROI)
+    if not blobs:
+        return None, 0, "NO_BLOB"
+
+    radar_x = get_radar_target_x(w)          # None이면 레이더 신뢰 불가 → 게이팅 안 함
+    used_blobs = blobs
+    mode = "NO_RADAR"                         # 로그/화면 표시용 현재 모드
+    if radar_x is not None:
+        cv2.line(frame, (int(radar_x), ry1), (int(radar_x), ry2), (0, 140, 255), 2)  # 레이더가 가리키는 위치를 주황 세로선으로 표시
+        gate_half = w * RADAR_GATE_HALF_WIDTH_RATIO
+        gated = [b for b in blobs
+                 if (radar_x - gate_half) <= ((b[0] + b[2]) / 2.0) <= (radar_x + gate_half)]  # 블롭 중심 x가 게이트 안에 있는지
+        if gated:
+            used_blobs = gated
+            mode = "RADAR_GATED"              # 레이더-카메라 일치 → 게이팅된 블롭만 사용
+        else:
+            mode = "RADAR_DISAGREE"           # 레이더 위치엔 빨간 블롭이 없음 → 안전하게 전체 블롭 사용(신호 놓치지 않기 위해)
+
+    redness_values = []
+    for (bx1, by1, bx2, by2) in used_blobs:
+        box_color = (0, 255, 0) if mode == "RADAR_GATED" else (0, 200, 200)  # 레이더로 골라진 블롭=초록, 아니면 청록으로 구분
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), box_color, 2)
+        rv = get_redness(frame, (bx1, by1, bx2, by2))
+        if rv is not None:
+            redness_values.append(rv)
+
+    if redness_values:
+        return float(np.mean(redness_values)), len(used_blobs), mode
+    return None, 0, mode
 
 
 def main():
@@ -166,6 +281,12 @@ def main():
     if not cap.isOpened():
         print("카메라를 열 수 없습니다.")
         return
+    # 웹캠에게 최대한 높은 해상도로 찍어달라고 요청 (지원 안 하면 웹캠이 알아서 가장 가까운 값으로 맞춤)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[카메라] 요청 해상도 {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} → 실제 적용된 해상도 {actual_w}x{actual_h}")
 
     # ===== ★STM32 시리얼 포트 연결 =====
     try:                                                  # 시리얼 포트 연결 시도, 실패해도 영상처리 자체는 계속 되게(레이더 없이) 처리
@@ -180,88 +301,91 @@ def main():
 
     history = deque(maxlen=SMOOTHING_FRAMES)
     baseline = None
-    last_brightness = None
+    last_redness = None
     frame_count = 0
-    last_car_box = None
-    last_yolo_time = 0.0
+    last_b_send_time = 0.0
+    last_c_send_time = 0.0
     print("Ctrl+C로 종료 | 5프레임마다 latest_frame.jpg 저장 | 30프레임째 자동 베이스라인 설정")
-    print(f"YOLO는 {YOLO_INTERVAL}프레임마다 1회만 실행 (속도 최적화)")
+    print(f"스캔 ROI(항상 고정, 레이더 상태와 무관): 가로 {ROI_X1_RATIO*100:.0f}~{ROI_X2_RATIO*100:.0f}%, 세로 {ROI_Y1_RATIO*100:.0f}~{ROI_Y2_RATIO*100:.0f}%")
+    print(f"레이더 게이팅: 신뢰 가능(연속 {RADAR_MIN_SAMPLES}샘플+최근 {RADAR_STALE_TIMEOUT_SEC:.0f}초 이내)할 때만, 위치 ±{RADAR_GATE_HALF_WIDTH_RATIO*100:.0f}% 안 블롭만 우선 사용 (불일치시 자동 폴백)")
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 print("프레임을 읽을 수 없습니다.")
                 break
-            frame = cv2.resize(frame, (640, 480))
+            frame = cv2.resize(frame, (WORK_WIDTH, WORK_HEIGHT))
             frame_count += 1
-            run_yolo_this_frame = (frame_count % YOLO_INTERVAL == 1) or (last_car_box is None)
-            car_found = False
-            if run_yolo_this_frame:
-                t0 = time.time()
-                results = model(frame, classes=[2], verbose=False, imgsz=YOLO_IMGSZ)
-                last_yolo_time = time.time() - t0
-                boxes = results[0].boxes
-                if len(boxes) > 0:
-                    areas = []
-                    for box in boxes:
-                        bx1, by1, bx2, by2 = box.xyxy[0].tolist()
-                        areas.append((bx2 - bx1) * (by2 - by1))
-                    biggest_idx = int(np.argmax(areas))
-                    best_box = boxes[biggest_idx]
-                    x1, y1, x2, y2 = best_box.xyxy[0].tolist()
-                    box_area = (x2 - x1) * (y2 - y1)
-                    frame_area = frame.shape[0] * frame.shape[1]
-                    if box_area >= frame_area * MIN_CAR_AREA_RATIO:
-                        last_car_box = (x1, y1, x2, y2)
-                    else:
-                        last_car_box = None
-                else:
-                    last_car_box = None
-            if last_car_box is not None:
-                brightness, blob_count = process_taillights(frame, last_car_box)
-                if brightness is not None:
-                    last_brightness = brightness
-                    history.append(brightness)
-                    smoothed = float(np.mean(history))
-                    x1, y1, x2, y2 = last_car_box
-                    delta = None
-                    if baseline is not None:
-                        delta = smoothed - baseline
-                        status = "이상(밝아짐)" if delta > DELTA_THRESHOLD else "정상"
-                        cv2.putText(frame, f"delta={delta:.1f} {status}", (int(x1), max(0, int(y1) - 10)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                        # ===== ★STM32로 밝기 델타/이상여부 전송 =====
-                        if stm32_ser is not None:                            # 시리얼 연결이 살아있으면
-                            try:                                             # 전송 중 케이블 문제 등으로 에러 나도 영상처리는 안 멈추게
-                                anomaly_flag = 1 if delta > DELTA_THRESHOLD else 0   # 밝아짐 감지되면 1, 아니면 0
-                                msg = f"B,{delta:.1f},{anomaly_flag}\r\n"            # "B,밝기델타,이상여부\r\n" 형식으로 조립
-                                stm32_ser.write(msg.encode('utf-8'))                  # STM32로 전송
-                            except Exception as e:
-                                print(f"[STM32] 전송 에러: {e}")
-                    cv2.putText(frame, f"R={smoothed:.1f} (blobs={blob_count})", (int(x1), int(y2) + 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-                car_found = True
-            if not car_found:
-                cv2.putText(frame, "차량 인식 대기 중...", (10, 30),
+
+            # ===== ★변경: YOLO 없이 매 프레임 바로 ROI에서 빨간 덩어리 스캔 (더 이상 N프레임마다 건너뛸 필요 없음, 훨씬 가벼움) =====
+            redness, blob_count, radar_mode = scan_roi_for_brake_light(frame)
+            blob_found = redness is not None
+
+            if blob_found:
+                last_redness = redness
+                history.append(redness)
+                smoothed = float(np.mean(history))
+                delta = None
+                if baseline is not None:
+                    delta = smoothed - baseline
+                    status = "ANOMALY" if delta > DELTA_THRESHOLD else "normal"
+                    # ★참고: cv2.putText는 한글(유니코드) 렌더링을 지원하지 않아 화면에 "????"로 깨져 나옴
+                    #        → 화면 표시용 텍스트는 영어로, 터미널 로그(print)는 한글 그대로 유지
+                    cv2.putText(frame, f"delta={delta:.1f} {status}", (10, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    # ===== ★STM32로 밝기 델타/이상여부 전송 (200ms 속도 제한) =====
+                    now_t = time.time()
+                    if stm32_ser is not None and (now_t - last_b_send_time) >= STM32_SEND_INTERVAL_SEC:
+                        try:
+                            anomaly_flag = 1 if delta > DELTA_THRESHOLD else 0   # 밝아짐 감지되면 1, 아니면 0
+                            msg = f"B,{delta:.1f},{anomaly_flag}\r\n"            # "B,밝기델타,이상여부\r\n" 형식으로 조립
+                            stm32_ser.write(msg.encode('utf-8'))                  # STM32로 전송
+                            last_b_send_time = now_t                              # 마지막 전송 시각 갱신
+                        except Exception as e:
+                            print(f"[STM32] 전송 에러: {e}")
+                cv2.putText(frame, f"redness={smoothed:.1f} (blobs={blob_count})", (10, 75),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+            if not blob_found:
+                cv2.putText(frame, "waiting for red light...", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            if frame_count == BASELINE_AT_FRAME and last_brightness is not None:
-                baseline = last_brightness
+
+            # ===== 지금 이 순간 검출 여부를 눈에 확 띄게 표시 (화면 테두리 색 + 큰 글씨) =====
+            h_disp, w_disp = frame.shape[:2]
+            border_color = (0, 200, 0) if blob_found else (0, 0, 220)   # 초록=검출됨, 빨강=미검출 (BGR 순서)
+            cv2.rectangle(frame, (0, 0), (w_disp - 1, h_disp - 1), border_color, 6)  # 화면 테두리 굵게
+            status_text = "RED LIGHT DETECTED" if blob_found else "NOT DETECTED"
+            cv2.putText(frame, status_text, (10, h_disp - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, border_color, 2)
+
+            # ===== 지금 이 순간의 카메라 검출 상태를 STM32로도 실시간 전송 (LCD에 표시하기 위함, 200ms 속도제한) =====
+            now_t2 = time.time()
+            if stm32_ser is not None and (now_t2 - last_c_send_time) >= STM32_SEND_INTERVAL_SEC:
+                try:
+                    stm32_ser.write(f"C,{1 if blob_found else 0}\r\n".encode('utf-8'))
+                    last_c_send_time = now_t2
+                except Exception as e:
+                    print(f"[STM32] 카메라상태 전송 에러: {e}")
+
+            if frame_count == BASELINE_AT_FRAME and last_redness is not None:
+                baseline = last_redness
                 print(f"[자동] 베이스라인 설정: {baseline:.1f}")
+
             if frame_count % SAVE_EVERY_N_FRAMES == 0:
                 cv2.imwrite("latest_frame.jpg", frame)
-                yolo_info = f", yolo={last_yolo_time*1000:.0f}ms" if run_yolo_this_frame else ""
-                radar_info = ""                                            # ★추가: 로그에 레이더 값도 같이 찍어줌 (참고용)
+                radar_info = ""                                            # 로그에 레이더 값도 같이 찍어줌 (참고용)
                 with serial_data_lock:
                     if latest_radar_distance is not None:
-                        radar_info = f", radar=D{latest_radar_distance:.1f}/S{latest_radar_speed:.1f}"
-                if last_brightness is not None:
+                        angle_str = f"/A{latest_radar_angle:.0f}" if latest_radar_angle is not None else ""
+                        radar_info = f", radar=D{latest_radar_distance:.1f}/S{latest_radar_speed:.1f}{angle_str}"
+                if last_redness is not None:
                     delta_str = ""
                     if baseline is not None:
-                        d = last_brightness - baseline
+                        d = last_redness - baseline
                         delta_str = f", delta={d:.1f}"
-                    print(f"frame={frame_count}, brightness={last_brightness:.1f}{delta_str}{yolo_info}{radar_info}")
+                    print(f"frame={frame_count}, redness={last_redness:.1f}{delta_str}{radar_info}, mode={radar_mode}")
                 else:
-                    print(f"frame={frame_count}, 차량 미검출{yolo_info}{radar_info}")
+                    print(f"frame={frame_count}, 빨간불빛 미검출{radar_info}, mode={radar_mode}")
     except KeyboardInterrupt:
         print("\n종료합니다.")
     cap.release()
