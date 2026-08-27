@@ -118,10 +118,18 @@ volatile int8_t radar_angle_deg  = 0;       // 파싱된 최신 각도값(도)
 // ★추가: 실차 테스트에서 거리값이 프레임마다 완전히 다른 물체로 튀는 문제(예: 2m→47m) 발견 후 추가한 상태값들
 volatile float radar_track_distance_m = -1.0f;  // "지금 추적 중인 차"의 최근 원시 거리값 (다음 프레임에서 같은 차인지 판단하는 기준), -1=트랙 없음
 #define RADAR_TRACK_GATE_M 6.0f                   // 이 거리(m) 이내의 타겟만 "같은 차(트랙 유지)"로 인정. 그보다 크게 차이나면 다른 물체로 간주하고 재탐색
-static float radar_dist_hist[3]  = {0.0f, 0.0f, 0.0f};  // 최근 3프레임 원시 거리값 버퍼 (median 스무딩용)
-static float radar_speed_hist[3] = {0.0f, 0.0f, 0.0f};  // 최근 3프레임 원시 속도값 버퍼
-static uint8_t radar_hist_idx    = 0;             // 버퍼에 다음 값을 쓸 위치(0~2 순환)
-static uint8_t radar_hist_count  = 0;             // 지금까지 몇 개 쌓였는지 (3 미만이면 아직 스무딩 없이 최신값 그대로 사용)
+// ★변경: S(속도)도 실차에서 D랑 같이 튀는 게 확인됨 → S는 WARN 판정에 직접 쓰이는 값이라 반응속도보다
+// 정확성이 더 중요 → D랑 똑같이 median-of-5로 올림 (연속 2프레임까지 튀어도 걸러짐)
+static float radar_dist_hist[5]  = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};  // 최근 5프레임 원시 거리값 버퍼 (median 스무딩용)
+static float radar_speed_hist[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};  // 최근 5프레임 원시 속도값 버퍼
+static uint8_t radar_dist_hist_idx    = 0;        // 거리 버퍼에 다음 값을 쓸 위치(0~4 순환)
+static uint8_t radar_dist_hist_count  = 0;        // 거리 버퍼에 지금까지 몇 개 쌓였는지 (5 미만이면 최신값 그대로 사용)
+static uint8_t radar_hist_idx    = 0;             // 속도 버퍼에 다음 값을 쓸 위치(0~4 순환)
+static uint8_t radar_hist_count  = 0;             // 속도 버퍼에 지금까지 몇 개 쌓였는지 (5 미만이면 아직 스무딩 없이 최신값 그대로 사용)
+#define RADAR_ANGLE_GATE_DEG 8    // ★추가: 트랙 연속성 없어서 재탐색할 때, 이 각도(도) 밖의 타겟은 아예 후보에서 제외
+                                   // (부채꼴로 넓게 잡는 레이더 특성상, 게이트 없이 "그나마 제일 정면에 가까운 것"만
+                                   //  고르면 완전히 딴 물체를 골라버릴 수 있어서 — 지금 테스트 거리(10~20m대)에선
+                                   //  옆차선 차도 이 각도보단 넓게 벌어져 보이므로 충분히 안전한 값)
 // ===== 레이더 관련 새 코드 끝 =====
 
 // ===== Pi 통신(USART2) 관련 =====
@@ -149,11 +157,22 @@ volatile SpeedSample front_speed_history[SPEED_HISTORY_LEN];  // 앞차 절대�
 volatile uint8_t history_index = 0;         // 다음에 이력을 저장할 배열 위치(인덱스)
 volatile uint8_t history_count = 0;         // 지금까지 몇 개의 이력이 쌓였는지 (최대 SPEED_HISTORY_LEN)
 volatile float front_car_speed_kmh = 0.0f;  // 계산된 앞차 절대속도 (레이더+내차속도 결합 결과)
-#define DECEL_THRESHOLD_KMH 5.0f            // 이 정도(km/h) 이상 감속하면 "감속 중"으로 판단하는 기준치
+#define DECEL_THRESHOLD_KMH 4.0f            // ★변경(실차테스트): 5.0→4.0 — 앞차만 감속하고 내차는 그대로일 때
+                                             // 레이더 상대속도만으로도 좀 더 민감하게 잡히도록 낮춤
+                                             // (D:, S: 값 자체는 신뢰도 있게 나온다고 확인됐어서, 기준치만 낮춰도
+                                             //  안전할 거라 판단 — 너무 낮추면 근거리에서 오탐 늘 수 있어 4.0 정도로 소폭만)
+#define DECEL_EXIT_THRESHOLD_KMH 2.5f       // ★추가: 히스테리시스 — "감속 아님(OFF)"으로 돌아가는 기준을 진입기준(4.0)보다
+                                             // 낮게 잡음. 감속량이 4.0 근처(예: 3.8~4.2)에서 노이즈로 왔다갔다해도,
+                                             // 한 번 ON(감속중)이 되면 2.5 밑으로 확실히 떨어지기 전까진 계속 ON 유지 →
+                                             // 경계선 깜빡임 때문에 WARN 0.5초 카운트가 자꾸 리셋되는 문제 완화
 #define DECEL_WINDOW_MS 1000                // 이 시간(ms) 동안의 속도 변화를 비교해서 감속 여부 판단
 #define ANOMALY_PERSIST_MS 500              // 이상 상황이 이 시간(ms) 이상 지속돼야 최종 "이상"으로 확정
+#define ANOMALY_GRACE_MS 300                // ★추가: 조건이 순간적으로(이 시간 이내) 깨져도 지속 카운트를 리셋하지 않고 봐줌
+                                              // (레이더/속도값 노이즈로 프레임 한두 개만 잠깐 조건 벗어나도 500ms 카운트가 매번 처음부터
+                                              //  다시 시작돼서 실제로는 계속 이상상황인데 WARN이 영원히 안 뜨는 문제가 있었음)
 volatile uint8_t is_decelerating = 0;       // 지금 앞차가 감속 중인지 여부 (0=아니오, 1=예)
 volatile uint32_t anomaly_start_tick = 0;   // "이상 의심" 상황이 시작된 시각 (지속시간 측정용)
+volatile uint32_t anomaly_last_true_tick = 0;  // ★추가: 마지막으로 조건이 참이었던 시각 (grace period 판단용)
 volatile uint8_t anomaly_confirmed = 0;     // 최종적으로 "이상"이 확정됐는지 (0.5초 지속 필터 통과 여부)
 #define LCD_WIDTH  240                      // 디스플레이 가로 픽셀 수
 #define LCD_HEIGHT 240                      // 디스플레이 세로 픽셀 수
@@ -233,6 +252,9 @@ int main(void)
   HAL_Delay(250);                           // 3000밀리초(3초) 동안 여기서 그냥 멈춰서 기다림 (다른 아무것도 안 하고 순수하게 대기)
   HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);   // 3초 지났으니 PWM 출력 정지 (소리 끊김)
   HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2(Pi)에서도 1바이트씩 받는 인터럽트 수신 시작
+  HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);      // ★추가: USART3(ELM327/HC-05) 인터럽트 수신 시작 — 이게 빠져있어서
+                                                              // 배선/페어링/시동 다 정상이어도 E:L에서 고정되던 버그의 원인이었음
+                                                              // (콜백 안에서는 재무장만 하고 있어서, 최초 1회 무장이 없으면 영원히 안 들어옴)
   LCD_Init();                                 // LCD 초기 설정 명령어들을 순서대로 전송
   HAL_Delay(100);                             // 초기화 안정화를 위해 잠깐 대기
   LCD_FillScreen(0x0000);                     // ★변경: 검증 끝났으니 진단용 초록화면 대신 검정 배경으로 시작 (이제 그 위에 거리/속도/경고 텍스트를 그림)
@@ -302,7 +324,9 @@ int main(void)
           // ===== ★추가: 디스플레이에 거리/속도/경고상태 표시 =====
           {
               static uint32_t last_lcd_update_tick = 0;             // 마지막으로 화면 갱신한 시각(ms)
-              if (HAL_GetTick() - last_lcd_update_tick >= 300)        // 300ms마다 한 번씩 갱신 (너무 자주 그리면 SPI 부하만 커짐)
+              if (HAL_GetTick() - last_lcd_update_tick >= 100)        // ★변경: 300→100ms — 어차피 메인루프 자체가 ELM327 응답 대기 때문에
+                                                                        // 한 바퀴에 최소 200ms 걸리니, 100ms로 낮추면 매 루프마다 빠짐없이
+                                                                        // 갱신됨(이전엔 300ms라 루프 한두 번씩 건너뛰어서 체감상 더 느렸음)
               {
                   LCD_UpdateStatus();                                   // 거리/속도/경고문구를 화면에 그림
                   last_lcd_update_tick = HAL_GetTick();
@@ -759,32 +783,47 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     else if (huart->Instance == USART2)      // USART2(Pi)에서 발생한 인터럽트인 경우
     {
         char c = (char)pi_rx_byte;           // 받은 1바이트를 문자로 변환
-        if (c == '\n' || c == '\r')          // 줄바꿈 문자를 만나면 (Pi는 파이썬이라 \n을 씀)
+        // ★변경(진짜 원인 발견): 예전엔 여기서 pi_line_ready==1이어도 그냥 계속 다음 바이트를 받아버려서,
+        // 메인루프가 아직 이전 줄("B,...")을 다 읽기도 전에 다음 줄("C,...")이 그 위에 덮어써지는
+        // 레이스 컨디션이 있었음. Pi가 "B,"와 "C,"를 프레임마다 연달아 빠르게 보내는데, 메인루프가
+        // LCD 갱신 등으로 잠깐이라도 늦어지면 이게 자주 발생 → sscanf가 깨진 문자열을 읽어서 파싱 실패 →
+        // 파싱 실패하면 pi_anomaly_flag는 "마지막으로 성공했던 값"에 그대로 멈춰있음 → 그게 하필 과거에
+        // 1(밝아짐)로 찍힌 값이었다면, 미등을 꺼놔도 계속 "밝아짐 상태"로 착각해서 WARN이 영원히 안 뜸.
+        // → 메인루프가 이전 줄을 아직 다 못 읽었으면(pi_line_ready==1), 새 바이트를 버퍼에 아예 안 쓰고
+        //   무시함(버림). 최악의 경우 그 한 줄만 스킵되고, 다음 줄부터 다시 정상적으로 받힘 — 덮어쓰기로
+        //   기존 값을 깨뜨리는 것보다 한 줄 스킵이 훨씬 안전함.
+        if (!pi_line_ready)
         {
-            if (pi_rx_index > 0)             // 빈 줄이 아니라 실제로 뭔가 받은 경우에만
+            if (c == '\n' || c == '\r')          // 줄바꿈 문자를 만나면 (Pi는 파이썬이라 \n을 씀)
             {
-                pi_rx_line[pi_rx_index] = '\0';  // 문자열 끝에 널문자 추가
-                pi_line_ready = 1;            // 한 줄 완성 깃발 올림
-                pi_rx_index = 0;              // ★추가: 메인루프가 아직 이 줄을 처리 못했더라도, 다음 줄은 무조건 처음부터 새로 채우게 함
-                                               // (예전엔 메인루프가 처리한 뒤에야 0으로 리셋해서, 그 사이에 새 메시지가 들어오면
-                                               //  이전 메시지 뒤에 이어붙으면서 내용이 깨지는 문제가 있었음 — 지금처럼 Pi가
-                                               //  "B,"와 "C," 메시지를 빠르게 연달아 보낼 때 특히 자주 발생했을 것으로 추정)
+                if (pi_rx_index > 0)             // 빈 줄이 아니라 실제로 뭔가 받은 경우에만
+                {
+                    pi_rx_line[pi_rx_index] = '\0';  // 문자열 끝에 널문자 추가
+                    pi_line_ready = 1;            // 한 줄 완성 깃발 올림 (메인루프가 처리할 때까지 유지됨)
+                    pi_rx_index = 0;              // 다음 줄 받을 준비(단, pi_line_ready가 0이 되기 전까진 위에서 걸러짐)
+                }
+            }
+            else if (pi_rx_index < PI_RX_LINE_MAX - 1)  // 버퍼에 공간 남아있으면
+            {
+                pi_rx_line[pi_rx_index++] = c;   // 문자 저장하고 인덱스 증가
             }
         }
-        else if (pi_rx_index < PI_RX_LINE_MAX - 1)  // 버퍼에 공간 남아있으면
-        {
-            pi_rx_line[pi_rx_index++] = c;   // 문자 저장하고 인덱스 증가
-        }
+        // else: pi_line_ready==1인 동안 들어오는 바이트는 그냥 버림 (덮어쓰기 방지)
         HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2 다음 바이트 재무장
     }
 }
-// ★추가: 3개 값의 중간값(median) 반환 — 순간적으로 1개만 튀는 노이즈를 무시하기 위한 스무딩용
-static float Median3(float a, float b, float c)
+// ★추가: 5개 값의 중간값(median) 반환 — 연속 2프레임까지 튀는 노이즈도 걸러내기 위한 D(거리) 전용 스무딩
+static float Median5(float v[5])
 {
-    if (a > b) { float tmp = a; a = b; b = tmp; }
-    if (b > c) { float tmp = b; b = c; c = tmp; }
-    if (a > b) { float tmp = a; a = b; b = tmp; }
-    return b;                                                   // 정렬 후 가운데 값
+    float a[5]; for (uint8_t i = 0; i < 5; i++) a[i] = v[i];    // 원본 순서 보존을 위해 복사본에서 정렬
+    for (uint8_t i = 0; i < 5; i++)                             // 단순 버블정렬(5개라 충분히 빠름)
+    {
+        for (uint8_t j = 0; j < 4 - i; j++)
+        {
+            if (a[j] > a[j+1]) { float tmp = a[j]; a[j] = a[j+1]; a[j+1] = tmp; }
+        }
+    }
+    return a[2];                                                // 정렬 후 정중앙(인덱스 2) 값
 }
 
 // 완성된 레이더 프레임(페이로드)을 해석해서 거리/속도/각도로 변환하는 함수
@@ -800,6 +839,7 @@ void ParseRadarFrame(void)
         radar_distance_m = -1.0f;                            // "유효한 타겟 없음" 상태로 표시해둠
         radar_track_distance_m = -1.0f;                       // ★추가: 타겟이 사라졌으니 트랙(연속성)도 리셋 — 다음에 나타나는 건 새 차일 수 있으므로
         radar_hist_count = 0;                                 // ★추가: median 버퍼도 리셋 (끊긴 값을 다음 차 값이랑 섞어서 중간값 내면 안 되니까)
+        radar_dist_hist_count = 0;                            // ★추가: 거리 median 버퍼(5개)도 같이 리셋
         return;                                                // 더 처리할 게 없으므로 함수 종료
     }
 
@@ -837,12 +877,22 @@ void ParseRadarFrame(void)
             const volatile uint8_t *ti = &radar_payload_buf[1 + i * RADAR_TARGET_SZ];
             int16_t angle_i = (int16_t)ti[1] - 0x80;
             int16_t abs_angle_i = (angle_i < 0) ? -angle_i : angle_i;
+            if (abs_angle_i > RADAR_ANGLE_GATE_DEG) continue;     // ★추가: 각도 게이트 — 너무 삐딱한(정면에서 크게 벗어난)
+                                                                    // 물체는 아예 후보에서 제외 (부채꼴 오탐 방지)
             if (abs_angle_i < best_abs_angle)
             {
                 best_abs_angle = abs_angle_i;
                 best_idx = i;
             }
         }
+    }
+    if (best_idx == 0xFF)                                     // ★추가: 각도 게이트 때문에 후보가 하나도 없으면(전방에 아무것도 없음)
+    {                                                           // "유효한 타겟 없음"으로 처리하고 이번 프레임은 그냥 종료
+        radar_distance_m = -1.0f;
+        radar_track_distance_m = -1.0f;
+        radar_hist_count = 0;
+        radar_dist_hist_count = 0;
+        return;
     }
     const volatile uint8_t *t = &radar_payload_buf[1 + best_idx * RADAR_TARGET_SZ];  // 최종 선택된 타겟 블록
 
@@ -856,27 +906,25 @@ void ParseRadarFrame(void)
     radar_track_distance_m = (float)distance_m_raw;            // ★추가: 다음 프레임 연속성 판단 기준으로 "이번에 고른 원시 거리"를 저장
 
     float raw_distance_m = (float)distance_m_raw;
-    float raw_speed_kmh  = (speed_dir == 0x01) ? -(float)speed_raw : (float)speed_raw;
-                                                                  // 접근중(가까워짐)이면 음수, 멀어지면 양수로 부호 통일
+    // ★변경(실차 데이터로 확인된 버그 fix): 거리(D)가 실제로 늘어나는데(멀어지는데)도 S가 계속 음수로
+    // 나온다는 게 실측으로 확인됨 → speed_dir 부호 가정이 반대였음. 그래서 조건을 반전시킴.
+    float raw_speed_kmh  = (speed_dir == 0x01) ? (float)speed_raw : -(float)speed_raw;
+                                                                  // 이제 speed_dir==0x01이면 멀어짐(양수), 아니면 가까워짐(음수)
                                                                   // (UpdateFrontCarSpeed에서 "양수=멀어짐" 가정과 맞춤)
 
-    // ★추가: median-of-3 스무딩 — 센서 자체의 ±1~2m/±수km/h 노이즈로 인해 값이 자잘하게 떨리는 것을 완화
-    // (완전히 다른 물체로 튀는 문제는 위의 트랙 연속성 로직이 막아주고, 이건 그 다음 단계의 잔여 노이즈 제거용)
-    radar_dist_hist[radar_hist_idx]  = raw_distance_m;
-    radar_speed_hist[radar_hist_idx] = raw_speed_kmh;
-    radar_hist_idx = (radar_hist_idx + 1) % 3;
-    if (radar_hist_count < 3) radar_hist_count++;
+    // ★변경: D(거리), S(속도) 둘 다 median-of-5 — S도 실차에서 튀는 게 확인돼서 정확성 우선으로 통일
+    // (완전히 다른 물체로 튀는 문제는 위의 트랙 연속성+각도게이트 로직이 막아주고, 이건 그 다음 단계의 잔여 노이즈 제거용)
+    radar_dist_hist[radar_dist_hist_idx] = raw_distance_m;
+    radar_dist_hist_idx = (radar_dist_hist_idx + 1) % 5;
+    if (radar_dist_hist_count < 5) radar_dist_hist_count++;
 
-    if (radar_hist_count < 3)                                  // 아직 3개 안 모였으면(막 시작/트랙 재시작 직후) 최신값 그대로 사용
-    {
-        radar_distance_m = raw_distance_m;
-        radar_speed_kmh  = raw_speed_kmh;
-    }
-    else                                                        // 3개 모이면 median 사용 — 순간 튀는 값 1개는 자동으로 무시됨
-    {
-        radar_distance_m = Median3(radar_dist_hist[0], radar_dist_hist[1], radar_dist_hist[2]);
-        radar_speed_kmh  = Median3(radar_speed_hist[0], radar_speed_hist[1], radar_speed_hist[2]);
-    }
+    radar_speed_hist[radar_hist_idx] = raw_speed_kmh;
+    radar_hist_idx = (radar_hist_idx + 1) % 5;
+    if (radar_hist_count < 5) radar_hist_count++;
+
+    radar_distance_m = (radar_dist_hist_count < 5) ? raw_distance_m : Median5(radar_dist_hist);
+    radar_speed_kmh  = (radar_hist_count < 5) ? raw_speed_kmh : Median5(radar_speed_hist);
+                                                                  // 둘 다 5개 안 모였으면(막 시작/트랙 재시작 직후) 최신값 그대로, 모이면 median
     radar_angle_deg  = (int8_t)angle_raw;                       // 각도 저장 (스무딩 없이 그대로 — 표시/게이팅용으로만 쓰여서 큰 영향 없음)
 
     (void)alarm_info; (void)snr;                                // 아직 안 쓰는 값들이라 컴파일 경고 방지용으로 캐스팅
@@ -950,11 +998,14 @@ void UpdateFrontCarSpeed(void)
         history_count++;                     // 쌓인 개수를 하나 늘림
     }
 }
-// 최근 이력을 보고 "지금 앞차가 감속 중인지"를 판정하는 함수
+// ★추가: 히스테리시스 상태(0=OFF, 1=ON) — 함수 호출 사이에 계속 유지되어야 하므로 static
+static uint8_t decel_hysteresis_state = 0;
+// 최근 이력을 보고 "지금 앞차가 감속 중인지"를 판정하는 함수 (히스테리시스 적용)
 uint8_t CheckDeceleration(void)
 {
     if (history_count < 2)                   // 비교할 만큼 이력이 충분히 쌓이지 않았으면
     {
+        decel_hysteresis_state = 0;          // ★추가: 데이터 자체가 부족한 상황이니 안전하게 OFF로 리셋
         return 0;                            // 판단 불가, 감속 아님으로 처리
     }
     uint32_t now = HAL_GetTick();            // 현재 시각
@@ -974,14 +1025,21 @@ uint8_t CheckDeceleration(void)
     }
     if (!found_old_sample)                    // 시간창만큼 오래된 샘플을 못 찾았으면 (아직 데이터가 부족)
     {
+        decel_hysteresis_state = 0;          // ★추가: 마찬가지로 데이터 부족 상황이니 안전하게 OFF로 리셋
         return 0;                            // 판단 불가, 감속 아님으로 처리
     }
     float speed_drop = oldest_speed_in_window - front_car_speed_kmh;  // 예전속도 - 현재속도 = 감속한 정도
-    if (speed_drop >= DECEL_THRESHOLD_KMH)    // 감속량이 기준치 이상이면
+    // ★변경: 단일 임계값 대신 히스테리시스 적용
+    if (speed_drop >= DECEL_THRESHOLD_KMH)           // 진입기준(4.0) 이상이면 확실히 ON
     {
-        return 1;                             // 감속 중이라고 판정
+        decel_hysteresis_state = 1;
     }
-    return 0;                                 // 그 외에는 감속 아님
+    else if (speed_drop <= DECEL_EXIT_THRESHOLD_KMH) // 해제기준(2.5) 이하로 확실히 떨어지면 OFF
+    {
+        decel_hysteresis_state = 0;
+    }
+    // else: 2.5~4.0 사이(회색지대)는 이전 상태를 그대로 유지 — 여기가 히스테리시스의 핵심
+    return decel_hysteresis_state;
 }
 // 감속여부 + 밝기이상여부를 종합해서 최종 "제동등 이상" 판정을 내리는 함수
 void UpdateAnomalyJudgement(void)
@@ -1000,16 +1058,28 @@ void UpdateAnomalyJudgement(void)
         {
             anomaly_start_tick = HAL_GetTick();  // 지금 시각을 "이상 의심 시작 시각"으로 기록
         }
+        anomaly_last_true_tick = HAL_GetTick();  // ★추가: 방금 조건이 참이었다고 기록 (grace period 계산 기준)
         if (HAL_GetTick() - anomaly_start_tick >= ANOMALY_PERSIST_MS)
         // 이 모순 상황이 시작된 후로 설정한 지속시간(예: 500ms) 이상 계속됐으면
         {
             anomaly_confirmed = 1;            // 최종적으로 "이상"이라고 확정
         }
     }
-    else                                       // 감속 중이 아니거나, 제동등이 정상으로 보이면 (모순 상황 해소)
+    else                                       // 감속 중이 아니거나, 제동등이 정상으로 보이면 (모순 상황 해소로 "보일" 수 있음)
     {
-        anomaly_start_tick = 0;               // 시작시각 초기화 (다음에 새로 감지되면 처음부터 다시 카운트)
-        anomaly_confirmed = 0;                // 이상 확정 상태도 해제
+        // ★변경: 예전엔 여기서 바로 리셋했는데, 프레임 한두 개만 순간적으로 조건 벗어나도(노이즈)
+        // 카운트가 매번 0부터 다시 시작돼서 실제 지속 이상상황도 WARN까지 못 가는 문제가 있었음
+        // → anomaly_start_tick이 이미 설정된 상태에서, 마지막으로 조건이 참이었던 시점으로부터
+        //   ANOMALY_GRACE_MS(300ms) 이내면 "일시적 끊김"으로 보고 카운트를 안 끊음
+        if (anomaly_start_tick != 0 && (HAL_GetTick() - anomaly_last_true_tick) < ANOMALY_GRACE_MS)
+        {
+            // 카운트 유지 (start_tick도, confirmed 상태도 안 건드림) — grace period 안이므로 계속 지속중인 걸로 취급
+        }
+        else
+        {
+            anomaly_start_tick = 0;               // 시작시각 초기화 (다음에 새로 감지되면 처음부터 다시 카운트)
+            anomaly_confirmed = 0;                // 이상 확정 상태도 해제
+        }
     }
     if (anomaly_confirmed)                    // 최종적으로 이상이 확정된 상태면
     {
