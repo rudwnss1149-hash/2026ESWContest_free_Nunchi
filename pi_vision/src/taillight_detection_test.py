@@ -58,7 +58,30 @@ SMOOTHING_FRAMES = 5
 # → 앞차와의 거리에 따라 redness/면적의 절대 크기 자체가 달라지므로(가까울수록 크게 잡힘),
 #   절대 차이 기준(예: +15)으로는 가까이/멀리 있을 때 기준이 안 맞음. 비율로 보면 거리 무관하게 일관됨
 REDNESS_RATIO_THRESHOLD = 0.35   # baseline 대비 redness(색 진하기)가 이 비율(35%) 이상 늘면 "밝아짐" 후보
-AREA_RATIO_THRESHOLD = 0.50      # baseline 대비 면적(빛이 번져 보이는 크기)이 이 비율(50%) 이상 늘면 "밝아짐" 후보
+# ★변경(실차테스트, 2차): 300%로 올렸는데도 또 다른 OFF 프레임에서 +410% 나와서 오탐 재발함
+# (지금까지 실측 누적: OFF 노이즈 = +163%, +410% / 진짜 ON = +5230%, +12095%, +14293% — 매번 최소 12배 이상 차이는 유지되고 있음)
+# → 임계값을 1500%로 크게 올려서 OFF 노이즈 쪽에 훨씬 넉넉한 여유(3.6배)를 둠 + baseline 자체도
+#   percentile=20으로 바꿔서(위 SlidingMinBaseline 참고) 분모(baseline)가 어쩌다 너무 작게 잡히는 것 자체를 완화함
+# ⚠ OFF 노이즈가 163%→410%로 계속 커지는 추세라, 이후에도 또 뚫리면 "비율 임계값 계속 올리기"보다
+#   redness랑 area를 AND로 묶는 방향으로 설계를 바꾸는 걸 고려해야 함
+AREA_RATIO_THRESHOLD = 15.00     # baseline 대비 면적(빛이 번져 보이는 크기)이 이 비율(1500%) 이상 늘면 "밝아짐" 후보
+
+# ★추가(테스트용, 실차): 니로 엔진브레이크(회생제동)가 약해서 "감속인데 브레이크등 안 켜짐" 상황을
+# 실제로 재현하기 어려워서, 카메라 판단을 무시하고 강제로 "밝기변화 없음"으로 STM32에 보고하는 테스트 스위치.
+# True로 켜면 실제로 브레이크를 밟든 안 밟든 상관없이 계속 anomaly_flag=0(브레이크등 안 보임)으로 전송됨
+# → 이 상태에서 그냥 감속(가볍게 브레이크 밟기 등)만 해봐도 STM32의 WARN 로직이 제대로 반응하는지 검증 가능.
+# ⚠⚠ STM32쪽 로직만 따로 테스트할 때만 켜두고, 실제 카메라 판단까지 포함한 진짜 검증할 땐 반드시 False로 되돌릴 것!
+# ★변경: 이제 실제로 미등/브레이크등을 물리적으로 껐다 켰다 하면서 테스트하니까, 진짜 카메라 판단(area 절대값 기준)이
+# 그대로 STM32에 전달되도록 다시 False로 되돌림 (더 이상 강제로 고정할 필요 없음)
+FORCE_NO_BRIGHTENING_TEST = False
+
+# ★추가(실차테스트, 핵심 변경): 실측 데이터 보니 area의 "절대값" 자체가 ON/OFF를 훨씬 확실하게 갈라줌
+# (확인된 ON area: 53290, 34314, 86234 / 확인된 OFF area(블롭 잡힌 경우): 2073, 7304 — 최소 4.7배 차이)
+# redness는 절대값으론 못 씀(ON=68.6이 OFF=69.8보다 낮게 나온 적도 있어서 겹침)
+# 그리고 평소엔 블롭 자체가 거의 안 잡혀서 baseline(비율 방식)이 제대로 못 쌓이는 문제도 있었는데,
+# 이 절대값 기준은 baseline/warmup이랑 완전히 무관하게 항상 바로 적용 가능 → 훨씬 안정적
+# 확인된 OFF 최대(7304)랑 ON 최소(34314) 사이에서 여유 있게 15000으로 설정
+ABS_AREA_ON_THRESHOLD = 15000
 # ★변경: 색 진하기(redness) OR 면적(area) 둘 중 하나라도 크게 튀면 "밝아짐"으로 판정
 # (브레이크등은 색만 진해지는 게 아니라 빛이 번지면서 눈에 보이는 면적도 커지는 경우가 많아서,
 #  두 신호를 같이 보면 한쪽만 볼 때보다 더 안정적으로 잡을 수 있음)
@@ -109,7 +132,11 @@ WORK_HEIGHT = 480
 # 멀리 있는 브레이크등이 화면에서 너무 작게(적은 픽셀 수로) 잡혀서 블롭 검출이 어려운 문제 완화용
 # 반드시 "자르기(crop) 먼저 → 그 다음에 확대(resize)" 순서로 해야 함 (반대로 하면 이미 저해상도로
 # 줄어든 걸 자르는 거라 확대 효과가 없음)
-DIGITAL_ZOOM_CROP_RATIO = 0.60   # 원본 프레임 중앙의 이 비율만큼만 잘라서 씀 (0.60 ≈ 1.67배 줌)
+DIGITAL_ZOOM_CROP_RATIO = 0.20   # ★변경(실차테스트): 3.33배→5배로 추가 확대
+                                   # (빨간 블롭 색상/면적 변화만 보는 용도라 화질 저하는 크게 문제 안 됨 — 그래서 더 확대함)
+                                   # 지금 영역 안에서 차가 작게 잡혀서 여유 있다고 판단해 5배까지 올림.
+                                   # 단, 앞차가 많이 가까워질 땐(거의 근접) 오히려 화면 밖으로 벗어날 수 있으니
+                                   # 그 상황만 테스트 때 유의 (이건 화질과 무관한 별개 리스크)
                                   # 값을 낮출수록(예: 0.4) 더 확대됨, 대신 화면에 보이는 범위(FOV)는 더 좁아짐
 
 # ===== ★STM32 시리얼 통신 설정 =====
@@ -129,9 +156,15 @@ serial_data_lock = threading.Lock()                 # 백그라운드 스레드�
 class SlidingMinBaseline:
     # ★추가(v4): redness랑 area 둘 다 "최근 N초 관찰값 중 최솟값" 방식으로 baseline을 잡아야 해서,
     # 중복 코드를 피하려고 공통 로직을 클래스로 뽑음. 두 개(redness용, area용)를 각각 만들어서 씀.
-    def __init__(self, window_sec, warmup_sec):
+    # ★변경(실차테스트): area는 순수 min(최솟값)으로 baseline을 잡으면, 어쩌다 한 프레임 area가
+    # 유독 작게 잡히는 순간(예: 순간적으로 블롭이 작게 인식됨) 그 값이 그대로 baseline이 돼버려서,
+    # 그 다음부터는 조금만 커져도 비율이 수백~수만 %로 폭발함(실측: OFF인데도 +163%, +410% 오탐 발생).
+    # → percentile 옵션 추가: area처럼 노이즈에 민감한 지표는 "완전 최솟값"이 아니라 "하위 20% 지점" 정도로
+    #   잡아서, 극단적으로 작은 프레임 1~2개가 baseline을 통째로 끌어내리지 못하게 함 (redness는 기존처럼 min 유지)
+    def __init__(self, window_sec, warmup_sec, percentile=0):
         self.window_sec = window_sec
         self.warmup_sec = warmup_sec
+        self.percentile = percentile   # 0=최솟값(min) 그대로, 그 외(예:20)=하위 N퍼센타일 값 사용
         self.buffer = deque()          # (시각, 값) 튜플들의 슬라이딩 윈도우
         self.first_sample_time = None  # 워밍업 시간 계산용
         self.value = None              # 현재 확정된 baseline (아직 워밍업 안 끝났으면 None)
@@ -145,7 +178,12 @@ class SlidingMinBaseline:
         if (self.first_sample_time is not None
                 and (now_t - self.first_sample_time) >= self.warmup_sec
                 and self.buffer):
-            self.value = min(v for _, v in self.buffer)
+            values = sorted(v for _, v in self.buffer)
+            if self.percentile <= 0 or len(values) < 5:   # 데이터 적을 땐 percentile 계산이 불안정하니 그냥 min 사용
+                self.value = values[0]
+            else:
+                idx = min(len(values) - 1, max(0, int(len(values) * self.percentile / 100.0)))
+                self.value = values[idx]
         return self.value
 
 
@@ -359,8 +397,8 @@ def main():
 
     history = deque(maxlen=SMOOTHING_FRAMES)        # redness 스무딩용
     area_history = deque(maxlen=SMOOTHING_FRAMES)    # ★추가(v4): area 스무딩용 (redness랑 같은 방식)
-    redness_baseline = SlidingMinBaseline(BASELINE_WINDOW_SEC, BASELINE_WARMUP_SEC)
-    area_baseline = SlidingMinBaseline(BASELINE_WINDOW_SEC, BASELINE_WARMUP_SEC)
+    redness_baseline = SlidingMinBaseline(BASELINE_WINDOW_SEC, BASELINE_WARMUP_SEC)             # redness는 기존처럼 min 유지
+    area_baseline = SlidingMinBaseline(BASELINE_WINDOW_SEC, BASELINE_WARMUP_SEC, percentile=20)  # ★변경: area는 하위 20%로 완화
     last_redness = None
     frame_count = 0
     last_b_send_time = 0.0
@@ -402,8 +440,11 @@ def main():
                 # ===== ★변경(v4): 절대 delta 대신 baseline 대비 비율(%)로 판정 — redness OR area 둘 중 하나만 튀어도 "밝아짐" =====
                 redness_ratio = ((smoothed - r_base) / r_base) if (r_base is not None and r_base > 1e-6) else None
                 area_ratio = ((smoothed_area - a_base) / a_base) if (a_base is not None and a_base > 1e-6) else None
+                # ★추가: 절대값 기준(baseline/warmup 무관, 항상 즉시 적용됨)을 세 번째 조건으로 OR 추가
+                abs_area_hit = (area is not None and area >= ABS_AREA_ON_THRESHOLD)
                 brightening = ((redness_ratio is not None and redness_ratio > REDNESS_RATIO_THRESHOLD)
-                                or (area_ratio is not None and area_ratio > AREA_RATIO_THRESHOLD))
+                                or (area_ratio is not None and area_ratio > AREA_RATIO_THRESHOLD)
+                                or abs_area_hit)
 
                 if redness_ratio is not None:
                     # ★변경(용어 정정): "ANOMALY"는 오해 소지가 큼 — 여기서 밝아짐 판정은 "브레이크등이
@@ -419,6 +460,11 @@ def main():
                     if stm32_ser is not None and (now_t - last_b_send_time) >= STM32_SEND_INTERVAL_SEC:
                         try:
                             anomaly_flag = 1 if brightening else 0   # 밝아짐 감지되면 1, 아니면 0
+                            # ★추가(테스트용): 니로가 엔진브레이크(회생제동)가 약해서 "감속인데 브레이크등 안 켜짐" 상황을
+                            # 실차로 재현하기 어려움 → 카메라 판단을 강제로 "밝기변화 없음(0)"으로 고정해서
+                            # STM32쪽 로직(레이더 감속판정+AND조건+WARN+부저)만 따로 검증. 실제 검증 끝나면 이 줄 지우거나 False로!
+                            if FORCE_NO_BRIGHTENING_TEST:
+                                anomaly_flag = 0
                             # ★변경: 두 번째 필드가 이제 "절대 밝기차"가 아니라 "redness 증가율(%)"임 (STM32는 그냥 표시만 하므로 파싱 영향 없음)
                             msg = f"B,{redness_ratio*100:.1f},{anomaly_flag}\r\n"   # "B,증가율(%),이상여부\r\n" 형식으로 조립
                             stm32_ser.write(msg.encode('utf-8'))                  # STM32로 전송
@@ -431,6 +477,19 @@ def main():
             if not blob_found:
                 cv2.putText(frame, "waiting for red light...", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                # ★추가(진짜 원인 발견): 빨간 덩어리가 아예 안 잡히면(blob_found=False) 위의 "B," 전송
+                # 블록 자체가 통째로 안 도는 구조였음 → 미등까지 완전히 꺼놓고 주변에 빨간불도 없는
+                # 환경(깨끗한 야간 테스트)에서는 "안 켜짐(0)"을 계속 보내는 게 아니라 아예 메시지가
+                # 하나도 안 나갔을 수 있음 → STM32의 pi_anomaly_flag가 갱신 안 되고 예전 값에 멈춰있거나,
+                # 한 번도 유효 데이터를 못 받았으면(pi_data_valid=0) WARN 판정 자체가 절대 안 걸림.
+                # → 빨간 게 하나도 안 잡혀도 "안 켜짐"을 명시적으로 계속 STM32에 보내도록 여기서 처리.
+                now_t3 = time.time()
+                if stm32_ser is not None and (now_t3 - last_b_send_time) >= STM32_SEND_INTERVAL_SEC:
+                    try:
+                        stm32_ser.write(f"B,0.0,0\r\n".encode('utf-8'))   # 빨간 것 자체가 없으니 당연히 "밝아짐 아님"
+                        last_b_send_time = now_t3
+                    except Exception as e:
+                        print(f"[STM32] 전송 에러: {e}")
 
             # ===== 지금 이 순간 검출 여부를 눈에 확 띄게 표시 (화면 테두리 색 + 큰 글씨) =====
             h_disp, w_disp = frame.shape[:2]
