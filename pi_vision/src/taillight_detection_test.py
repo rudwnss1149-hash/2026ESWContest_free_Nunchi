@@ -81,7 +81,7 @@ FORCE_NO_BRIGHTENING_TEST = False
 # 그리고 평소엔 블롭 자체가 거의 안 잡혀서 baseline(비율 방식)이 제대로 못 쌓이는 문제도 있었는데,
 # 이 절대값 기준은 baseline/warmup이랑 완전히 무관하게 항상 바로 적용 가능 → 훨씬 안정적
 # 확인된 OFF 최대(7304)랑 ON 최소(34314) 사이에서 여유 있게 15000으로 설정
-ABS_AREA_ON_THRESHOLD = 15000
+ABS_AREA_ON_THRESHOLD = 35000
 # ★변경: 색 진하기(redness) OR 면적(area) 둘 중 하나라도 크게 튀면 "밝아짐"으로 판정
 # (브레이크등은 색만 진해지는 게 아니라 빛이 번지면서 눈에 보이는 면적도 커지는 경우가 많아서,
 #  두 신호를 같이 보면 한쪽만 볼 때보다 더 안정적으로 잡을 수 있음)
@@ -132,7 +132,7 @@ WORK_HEIGHT = 480
 # 멀리 있는 브레이크등이 화면에서 너무 작게(적은 픽셀 수로) 잡혀서 블롭 검출이 어려운 문제 완화용
 # 반드시 "자르기(crop) 먼저 → 그 다음에 확대(resize)" 순서로 해야 함 (반대로 하면 이미 저해상도로
 # 줄어든 걸 자르는 거라 확대 효과가 없음)
-DIGITAL_ZOOM_CROP_RATIO = 0.20   # ★변경(실차테스트): 3.33배→5배로 추가 확대
+DIGITAL_ZOOM_CROP_RATIO = 0.20   # ★변경: 5배(0.20) 그대로 유지하기로 함 (3.33배로 되돌렸다가 다시 원복)
                                    # (빨간 블롭 색상/면적 변화만 보는 용도라 화질 저하는 크게 문제 안 됨 — 그래서 더 확대함)
                                    # 지금 영역 안에서 차가 작게 잡혀서 여유 있다고 판단해 5배까지 올림.
                                    # 단, 앞차가 많이 가까워질 땐(거의 근접) 오히려 화면 밖으로 벗어날 수 있으니
@@ -437,14 +437,12 @@ def main():
                     print(f"[자동] 베이스라인 첫 설정(frame={frame_count}): redness={r_base:.1f} (이후 계속 실시간 갱신됨)")
                     baseline_announced = True
 
-                # ===== ★변경(v4): 절대 delta 대신 baseline 대비 비율(%)로 판정 — redness OR area 둘 중 하나만 튀어도 "밝아짐" =====
+                # ===== ★변경(v5): 판정은 절대 area 값 하나로만 함 (redness_ratio/area_ratio는 표시/전송용으로만 계산해서 남겨둠) =====
                 redness_ratio = ((smoothed - r_base) / r_base) if (r_base is not None and r_base > 1e-6) else None
                 area_ratio = ((smoothed_area - a_base) / a_base) if (a_base is not None and a_base > 1e-6) else None
-                # ★추가: 절대값 기준(baseline/warmup 무관, 항상 즉시 적용됨)을 세 번째 조건으로 OR 추가
                 abs_area_hit = (area is not None and area >= ABS_AREA_ON_THRESHOLD)
-                brightening = ((redness_ratio is not None and redness_ratio > REDNESS_RATIO_THRESHOLD)
-                                or (area_ratio is not None and area_ratio > AREA_RATIO_THRESHOLD)
-                                or abs_area_hit)
+                # ★변경: OR 없이 area 절대값 하나로만 판정 (redness_ratio/area_ratio는 표시/전송용으로만 계산해서 남겨둠)
+                brightening = abs_area_hit
 
                 if redness_ratio is not None:
                     # ★변경(용어 정정): "ANOMALY"는 오해 소지가 큼 — 여기서 밝아짐 판정은 "브레이크등이
