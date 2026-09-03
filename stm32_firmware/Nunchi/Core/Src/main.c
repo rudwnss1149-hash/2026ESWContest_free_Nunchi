@@ -48,25 +48,21 @@ UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
-#define RX_LINE_MAX 32                     // 한 줄(응답) 버퍼의 최대 길이를 32바이트로 정의하는 매크로 상수
-volatile uint8_t rx_byte;                  // 인터럽트로 한 바이트씩 새로 받아올 때 임시로 담아두는 1바이트짜리 변수
-                                            // (volatile: 인터럽트 안에서 값이 바뀌므로, 컴파일러가 "안 바뀌는 값"이라고 착각해 최적화해버리는 걸 방지)
-volatile char rx_line[RX_LINE_MAX];        // 받은 바이트들을 한 글자씩 이어붙여서 "한 줄"을 완성해가는 문자 배열(버퍼)
-                                            // (volatile: 인터럽트 안에서 계속 채워지므로 최적화 방지 목적으로 붙임)
-volatile uint8_t rx_index = 0;             // rx_line 배열에서 지금 몇 번째 칸까지 채웠는지를 기억하는 위치 표시 변수, 시작값은 0(맨 앞)
-volatile uint8_t line_ready = 0;           // "한 줄이 완성됐다"는 신호를 메인 루프에 전달하는 깃발(flag) 변수, 시작값 0=아직 안 됨, 1=완성됨
-volatile int16_t last_speed_kmh = -1;      // 가장 최근에 파싱에 성공한 속도값(km/h)을 저장해두는 변수
-                                            // 시작값 -1은 "아직 한 번도 유효한 값을 못 받았다"는 뜻으로 정한 특수값
-volatile uint8_t elm_data_valid = 0;       // ★추가(디버그용): ELM327 응답을 실제로 한 번이라도 정상 파싱한 적 있는지 (0=아직없음, 1=있음)
+#define RX_LINE_MAX 32                     // 응답 한 줄 버퍼 최대 길이
+volatile uint8_t rx_byte;                  // 인터럽트로 한 바이트씩 받아오는 임시 변수
+                                            // (volatile: 인터럽트 안에서 바뀌는 값이라 컴파일러 최적화 방지용)
+volatile char rx_line[RX_LINE_MAX];        // 받은 바이트를 이어붙여 한 줄을 완성해가는 버퍼
+volatile uint8_t rx_index = 0;             // rx_line에서 지금까지 채운 위치, 시작값 0
+volatile uint8_t line_ready = 0;           // 한 줄 완성 신호 (0=대기, 1=완성)
+volatile int16_t last_speed_kmh = -1;      // 가장 최근 파싱 성공한 속도값(km/h), -1=아직 유효값 없음
+volatile uint8_t elm_data_valid = 0;       // ELM327 응답을 한 번이라도 정상 파싱했는지 (0=아직, 1=있음)
 
 // ============================================================================
-// ===== 레이더(HLK-LD2451) 수신 관련 — 실제 프로토콜 기준으로 재작성한 부분 =====
-// 출처: 하이링크 공식 문서 "HLK-LD2451 Serial Communication Protocol v1.03"
+// ===== 레이더(HLK-LD2451) 수신 관련 =====
 //   헤더 4바이트: F4 F3 F2 F1
-//   길이필드 2바이트 (헤더 뒤, 페이로드 길이 — 리틀엔디안으로 가정, 실측 재확인 필요)
+//   길이필드 2바이트 (페이로드 길이)
 //   페이로드: 타겟개수(1바이트) + 타겟마다 6바이트(경보정보/각도/거리/속도방향/속도/SNR) * 최대 5개
 //   테일 4바이트: F8 F7 F6 F5 / 체크섬 없음 / 기본 baudrate 115200
-// (기존에 있던 0xAA 0x55 헤더 + 고정 7바이트 가정은 삭제하고 이걸로 교체함)
 // ============================================================================
 #define RADAR_HDR_LEN       4     // 헤더 바이트 개수
 #define RADAR_LEN_FIELD_LEN 2     // 길이필드 바이트 개수
@@ -92,65 +88,55 @@ volatile uint16_t radar_payload_len  = 0;                  // 길이필드에서
 volatile uint8_t  radar_payload_idx  = 0;                  // 페이로드를 지금 몇 바이트째 받는 중인지
 volatile uint8_t  radar_tail_idx     = 0;                  // 테일을 지금 몇 바이트째 확인 중인지
 volatile uint8_t  radar_payload_buf[RADAR_MAX_PAYLOAD];    // 페이로드만 따로 모아 담는 버퍼
-volatile uint8_t  radar_byte;                              // (더 이상 사용 안 함: DMA 방식으로 바뀌면서 미사용, 호환성 위해 남겨둠)
+volatile uint8_t  radar_byte;                              // (DMA 방식으로 바뀌면서 더 이상 사용 안 함, 호환성 위해 남겨둠)
 volatile uint8_t  radar_frame_ready = 0;                   // 프레임 하나가 완전히(헤더+길이+페이로드+테일 검증) 도착했다는 신호
-volatile uint32_t radar_raw_byte_count = 0;                 // ★진단용: 프로토콜 해석과 무관하게, USART1로 바이트가 "몇 개나 도착했는지"만 세는 카운터
+volatile uint32_t radar_raw_byte_count = 0;                 // 프로토콜 해석과 무관하게 USART1로 들어온 바이트 총 개수
 
-// ★진단용: STM32가 USART1(레이더)에서 실제로 받은 raw 바이트를 그대로 모아뒀다가 Pi로 중계해서 보여주는 버퍼
-// (CH340으로 PC에서 본 것과 STM32가 진짜 받는 게 똑같은지 비교하기 위한 용도)
+// STM32가 USART1(레이더)에서 받은 raw 바이트를 그대로 모아 Pi로 중계하는 버퍼
+// (CH340으로 PC에서 본 것과 STM32가 실제로 받는 게 같은지 비교용)
 #define RADAR_DEBUG_BUF_LEN 64                                    // 한 번에 최대 몇 바이트까지 모아서 보낼지
 volatile uint8_t radar_debug_buf[RADAR_DEBUG_BUF_LEN];            // raw 바이트를 그대로 쌓아두는 버퍼
 volatile uint8_t radar_debug_len = 0;                             // 지금까지 몇 바이트나 쌓였는지
 
-// ===== ★추가: 레이더 DMA 순환수신 관련 =====
-// 인터럽트로 한 바이트씩 받는 방식은 레이더가 바이트를 빠르게 연달아 쏠 때 CPU가 못 따라가서
-// overrun(수신 놓침)이 잦았음 → DMA로 하드웨어가 알아서 계속 받아 버퍼에 채워넣게 하고,
-// 메인루프에서 여유 있을 때 그 버퍼를 읽어서 처리하는 방식으로 변경 (바이트 놓칠 위험 대폭 감소)
-#define RADAR_DMA_BUF_SIZE 2048                                    // DMA 순환버퍼 크기(바이트) — ELM327 대기용 딜레이가 부활해서 여유있게 키움
-volatile uint8_t radar_dma_buf[RADAR_DMA_BUF_SIZE];                // DMA가 하드웨어적으로 계속 채워넣는 순환버퍼
-volatile uint16_t radar_dma_last_pos = 0;                          // 마지막으로 처리(소비)한 위치(인덱스)
-// ===== DMA 관련 추가 끝 =====
+// ===== 레이더 DMA 순환수신 =====
+#define RADAR_DMA_BUF_SIZE 2048                                    // DMA 순환버퍼 크기(바이트)
+volatile uint8_t radar_dma_buf[RADAR_DMA_BUF_SIZE];                // DMA가 계속 채워넣는 순환버퍼
+volatile uint16_t radar_dma_last_pos = 0;                          // 마지막으로 처리한 위치(인덱스)
 
 volatile float radar_distance_m  = -1.0f;   // 파싱된 최신 거리값(m), -1.0=유효값 없음 (median 스무딩 적용된 값)
-volatile float radar_speed_kmh   = 0.0f;    // 파싱된 최신 상대속도값(km/h), 양수=멀어짐/음수=가까워짐 (median 스무딩 적용된 값)
+volatile float radar_speed_kmh   = 0.0f;    // 파싱된 최신 상대속도값(km/h), 양수=멀어짐/음수=가까워짐 (median필터 적용된 값)
 volatile int8_t radar_angle_deg  = 0;       // 파싱된 최신 각도값(도)
 
-// ★추가: 실차 테스트에서 거리값이 프레임마다 완전히 다른 물체로 튀는 문제(예: 2m→47m) 발견 후 추가한 상태값들
-volatile float radar_track_distance_m = -1.0f;  // "지금 추적 중인 차"의 최근 원시 거리값 (다음 프레임에서 같은 차인지 판단하는 기준), -1=트랙 없음
-#define RADAR_TRACK_GATE_M 6.0f                   // 이 거리(m) 이내의 타겟만 "같은 차(트랙 유지)"로 인정. 그보다 크게 차이나면 다른 물체로 간주하고 재탐색
-// ★변경: S(속도)도 실차에서 D랑 같이 튀는 게 확인됨 → S는 WARN 판정에 직접 쓰이는 값이라 반응속도보다
-// 정확성이 더 중요 → D랑 똑같이 median-of-5로 올림 (연속 2프레임까지 튀어도 걸러짐)
-static float radar_dist_hist[5]  = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};  // 최근 5프레임 원시 거리값 버퍼 (median 스무딩용)
-static float radar_speed_hist[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};  // 최근 5프레임 원시 속도값 버퍼
-static uint8_t radar_dist_hist_idx    = 0;        // 거리 버퍼에 다음 값을 쓸 위치(0~4 순환)
-static uint8_t radar_dist_hist_count  = 0;        // 거리 버퍼에 지금까지 몇 개 쌓였는지 (5 미만이면 최신값 그대로 사용)
-static uint8_t radar_hist_idx    = 0;             // 속도 버퍼에 다음 값을 쓸 위치(0~4 순환)
-static uint8_t radar_hist_count  = 0;             // 속도 버퍼에 지금까지 몇 개 쌓였는지 (5 미만이면 아직 스무딩 없이 최신값 그대로 사용)
-#define RADAR_ANGLE_GATE_DEG 8    // ★추가: 트랙 연속성 없어서 재탐색할 때, 이 각도(도) 밖의 타겟은 아예 후보에서 제외
-                                   // (부채꼴로 넓게 잡는 레이더 특성상, 게이트 없이 "그나마 제일 정면에 가까운 것"만
-                                   //  고르면 완전히 딴 물체를 골라버릴 수 있어서 — 지금 테스트 거리(10~20m대)에선
-                                   //  옆차선 차도 이 각도보단 넓게 벌어져 보이므로 충분히 안전한 값)
-// ===== 레이더 관련 새 코드 끝 =====
+// 실차 테스트에서 거리값이 프레임마다 완전히 다른 물체로 튀는 문제(예: 2m→47m)가 있어서 추가한 트랙 상태
+volatile float radar_track_distance_m = -1.0f;  // 추적 중인 차의 최근 원시 거리값 (다음 프레임에 같은 차인지 판단하는 기준), -1=트랙 없음
+#define RADAR_TRACK_GATE_M 6.0f                   // 이 거리(m) 이내 타겟만 같은 차로 인정, 벗어나면 다른 물체로 보고 재탐색
+// 속도(S)도 거리처럼 프레임마다 튀는 게 확인돼서 동일하게 median-of-5로 스무딩
+static float radar_dist_hist[5]  = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};  // 최근 5프레임 원시 거리값 (median 스무딩용)
+static float radar_speed_hist[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};  // 최근 5프레임 원시 속도값
+static uint8_t radar_dist_hist_idx    = 0;        // 거리 버퍼 다음 쓰기 위치(0~4 순환)
+static uint8_t radar_dist_hist_count  = 0;        
+static uint8_t radar_hist_idx    = 0;             // 속도 버퍼 다음 쓰기 위치(0~4 순환)
+static uint8_t radar_hist_count  = 0;             
+#define RADAR_ANGLE_GATE_DEG 8    // 트랙 연속성 없을 때 재탐색 시, 이 각도 밖 타겟은 후보에서 제외
 
 // ===== Pi 통신(USART2) 관련 =====
 #define PI_RX_LINE_MAX 32                  // Pi로부터 받는 한 줄의 최대 길이
 volatile uint8_t pi_rx_byte;               // Pi에서 인터럽트로 한 바이트씩 받을 임시 버퍼
 volatile char pi_rx_line[PI_RX_LINE_MAX];  // Pi가 보낸 한 줄을 모으는 버퍼
-volatile uint8_t pi_rx_index = 0;          // pi_rx_line에 지금 몇 번째까지 채웠는지
+volatile uint8_t pi_rx_index = 0;          // 몇 번째까지 채웠는지
 volatile uint8_t pi_line_ready = 0;        // Pi로부터 한 줄 다 받았다는 신호
 volatile float pi_brightness_delta = 0.0f; // Pi가 보내준 밝기 델타값 (파싱 결과 저장)
 volatile uint8_t pi_anomaly_flag = 0;      // Pi가 보내준 이상여부 (0=정상, 1=이상)
-volatile uint8_t pi_data_valid = 0;        // Pi로부터 유효한 데이터를 받은 적 있는지 (아직 한 번도 못 받았으면 0)
+volatile uint8_t pi_data_valid = 0;        // Pi로부터 유효한 데이터를 받은 적 있는지 (못 받았으면 0)
 uint32_t last_pi_send_tick = 0;            // STM32가 Pi한테 마지막으로 데이터 보낸 시각(ms) 기록용
-// ★추가: Pi가 실시간으로 보내는 "지금 카메라가 차를 검출했는지" 상태 (이상감지 로직과는 무관, LCD 표시 전용)
+// Pi가 실시간으로 보내는 카메라 검출 상태 (이상감지 로직과 무관, LCD 표시 전용)
 volatile uint8_t cam_detected = 0;         // 0=미검출(또는 아직 한 번도 못 받음), 1=검출됨
-// ★추가(디버그용): Pi<->STM32 통신이 실제로 되고 있는지 눈으로 확인하기 위한 카운터
-volatile uint32_t pi_total_lines = 0;      // USART2로 완성된 줄을 총 몇 개나 받았는지 (B, C, 뭐든 상관없이 다 셈)
+// Pi<->STM32 통신이 실제로 되는지 확인용 카운터
+volatile uint32_t pi_total_lines = 0;      // USART2로 완성된 줄을 총 몇 개나 받았는지 (B, C 상관없이 다 셈)
 volatile uint32_t pi_cam_msgs = 0;         // 그중 "C," 파싱에 성공한 횟수
-// ★추가(디버그용): "DECEL은 뜨는데 부저가 안 울린다"는 현장 문의에 대응 — 두 판정조건이
-// 실제로 동시에 얼마나 겹치는지 LCD로 바로 확인하기 위한 변수들 (UpdateAnomalyJudgement에서 매 루프 갱신)
-volatile uint8_t dbg_brake_missing = 0;    // 이번 판정에서 "제동등 꺼짐"으로 본 게 맞는지 (0=정상/제동등 켜짐, 1=꺼짐으로 판정)
-volatile uint32_t dbg_anomaly_ms = 0;      // 지금 "감속+제동등꺼짐" 모순 상황이 몇 ms째 지속중인지 (0이면 지금은 모순 아님)
+// DECEL/부저 불일치 디버깅용 — 두 판정조건이 실제로 얼마나 겹치는지 LCD로 확인 (UpdateAnomalyJudgement에서 매 루프 갱신)
+volatile uint8_t dbg_brake_missing = 0;    // 이번 판정에서 제동등 꺼짐으로 봤는지 (0=정상, 1=꺼짐)
+volatile uint32_t dbg_anomaly_ms = 0;      // 지금 "감속+제동등꺼짐" 모순 상황이 몇 ms째 지속중인지 (0이면 모순 아님)
 // ===== 판정 로직(이상감지) 관련 =====
 #define SPEED_HISTORY_LEN 10                // 앞차 절대속도 이력을 몇 개까지 저장할지 (최근 몇 번의 측정값)
 typedef struct {                            // 속도 측정값 하나를 저장하는 구조체 (값+측정시각을 묶어서 관리)
@@ -161,25 +147,19 @@ volatile SpeedSample front_speed_history[SPEED_HISTORY_LEN];  // 앞차 절대�
 volatile uint8_t history_index = 0;         // 다음에 이력을 저장할 배열 위치(인덱스)
 volatile uint8_t history_count = 0;         // 지금까지 몇 개의 이력이 쌓였는지 (최대 SPEED_HISTORY_LEN)
 volatile float front_car_speed_kmh = 0.0f;  // 계산된 앞차 절대속도 (레이더+내차속도 결합 결과)
-#define DECEL_THRESHOLD_KMH 4.0f            // ★변경(실차테스트): 5.0→4.0 — 앞차만 감속하고 내차는 그대로일 때
-                                             // 레이더 상대속도만으로도 좀 더 민감하게 잡히도록 낮춤
-                                             // (D:, S: 값 자체는 신뢰도 있게 나온다고 확인됐어서, 기준치만 낮춰도
-                                             //  안전할 거라 판단 — 너무 낮추면 근거리에서 오탐 늘 수 있어 4.0 정도로 소폭만)
-#define DECEL_EXIT_THRESHOLD_KMH 2.5f       // ★추가: 히스테리시스 — "감속 아님(OFF)"으로 돌아가는 기준을 진입기준(4.0)보다
-                                             // 낮게 잡음. 감속량이 4.0 근처(예: 3.8~4.2)에서 노이즈로 왔다갔다해도,
-                                             // 한 번 ON(감속중)이 되면 2.5 밑으로 확실히 떨어지기 전까진 계속 ON 유지 →
-                                             // 경계선 깜빡임 때문에 WARN 0.5초 카운트가 자꾸 리셋되는 문제 완화
+#define DECEL_THRESHOLD_KMH 4.0f            // 앞차 감속 판정 임계값(km/h), 실차 테스트로 5.0→4.0 조정
+#define DECEL_EXIT_THRESHOLD_KMH 2.5f       // 히스테리시스: OFF로 복귀하는 기준을 진입기준보다 낮게 잡아
+                                             // 경계값 근처 노이즈로 감속판정이 깜빡이는 걸 방지
 #define DECEL_WINDOW_MS 1000                // 이 시간(ms) 동안의 속도 변화를 비교해서 감속 여부 판단
 #define ANOMALY_PERSIST_MS 500              // 이상 상황이 이 시간(ms) 이상 지속돼야 최종 "이상"으로 확정
-#define ANOMALY_GRACE_MS 300                // ★추가: 조건이 순간적으로(이 시간 이내) 깨져도 지속 카운트를 리셋하지 않고 봐줌
-                                              // (레이더/속도값 노이즈로 프레임 한두 개만 잠깐 조건 벗어나도 500ms 카운트가 매번 처음부터
-                                              //  다시 시작돼서 실제로는 계속 이상상황인데 WARN이 영원히 안 뜨는 문제가 있었음)
+#define ANOMALY_GRACE_MS 300                // 조건이 잠깐(이 시간 이내) 깨져도 지속 카운트를 리셋하지 않고 유지
+                                            
 volatile uint8_t is_decelerating = 0;       // 지금 앞차가 감속 중인지 여부 (0=아니오, 1=예)
 volatile uint32_t anomaly_start_tick = 0;   // "이상 의심" 상황이 시작된 시각 (지속시간 측정용)
-volatile uint32_t anomaly_last_true_tick = 0;  // ★추가: 마지막으로 조건이 참이었던 시각 (grace period 판단용)
+volatile uint32_t anomaly_last_true_tick = 0;  // 마지막으로 조건이 참이었던 시각 (grace period 판단용)
 volatile uint8_t anomaly_confirmed = 0;     // 최종적으로 "이상"이 확정됐는지 (0.5초 지속 필터 통과 여부)
-#define LCD_WIDTH  240                      // 디스플레이 가로 픽셀 수
-#define LCD_HEIGHT 240                      // 디스플레이 세로 픽셀 수
+#define LCD_WIDTH  240                      
+#define LCD_HEIGHT 240                      
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -192,26 +172,25 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
-void ELM327_RequestSpeed(void);            // ELM327에게 "지금 속도 알려줘"라는 명령을 보내는 함수가 있다고 미리 알려주는 선언(원형)
-int ParseSpeedResponse(const char *raw);   // ELM327이 보낸 응답 문자열(raw)을 받아서 정수 속도값으로 바꿔주는 함수의 선언(원형)
-                                            // 매개변수 raw: 파싱할 원본 문자열 / 반환값: 성공시 속도값(0 이상), 실패시 -1
-void ParseRadarFrame(void);                // 완성된 레이더 프레임을 해석해서 거리/속도/각도로 변환하는 함수 선언
-void RadarProcessByte(uint8_t b);          // ★추가: 레이더 바이트 하나를 상태기계에 넣어 처리하는 함수 선언 (DMA버퍼 처리용)
-void RadarProcessDmaBuffer(void);          // ★추가: DMA 순환버퍼에 새로 쌓인 바이트들을 꺼내 처리하는 함수 선언
+void ELM327_RequestSpeed(void);            // ELM327에게 속도 요청 명령을 보내는 함수
+int ParseSpeedResponse(const char *raw);   // ELM327 응답 문자열을 파싱해서 속도값으로 변환 (실패시 -1)
+void ParseRadarFrame(void);                // 완성된 레이더 프레임을 해석해서 거리/속도/각도로 변환하는 함수
+void RadarProcessByte(uint8_t b);          // 레이더 바이트 하나를 상태기계에 넣어 처리 (DMA버퍼 처리용)
+void RadarProcessDmaBuffer(void);          // DMA 순환버퍼에 새로 쌓인 바이트들을 꺼내 처리하는 함수
 void Pi_SendRadarData(void);                // STM32가 Pi에게 레이더 데이터(거리, 상대속도)를 보내는 함수
 int Pi_ParseBrightnessResponse(const char *raw);  // Pi가 보낸 응답 문자열을 파싱하는 함수
-int Pi_ParseCameraStatus(const char *raw);          // ★추가: Pi가 보낸 "C,검출여부" 응답을 파싱하는 함수
+int Pi_ParseCameraStatus(const char *raw);          // Pi가 보낸 "C,검출여부" 응답을 파싱하는 함수
 void UpdateFrontCarSpeed(void);             // 레이더+내차속도를 결합해서 앞차 절대속도를 계산하고 이력에 저장하는 함수
 uint8_t CheckDeceleration(void);            // 최근 이력을 보고 "지금 감속 중인지" 판정하는 함수
 void UpdateAnomalyJudgement(void);          // 감속여부+밝기이상여부를 종합해서 최종 이상감지 판정을 내리는 함수
 void LCD_Reset(void);                       // LCD를 하드웨어적으로 리셋시키는 함수
-void LCD_WriteCommand(uint8_t cmd);         // LCD에 "명령"을 보내는 함수
-void LCD_WriteData(uint8_t data);           // LCD에 "데이터"를 보내는 함수
-void LCD_Init(void);                        // LCD 초기화(전원 인가 후 켜지도록 설정하는) 함수
+void LCD_WriteCommand(uint8_t cmd);         // LCD에 명령을 보내는 함수
+void LCD_WriteData(uint8_t data);           // LCD에 데이터를 보내는 함수
+void LCD_Init(void);                        // LCD 초기화 함수
 void LCD_FillScreen(uint16_t color);        // 화면 전체를 특정 색으로 채우는 함수
-void LCD_DrawChar(uint16_t x, uint16_t y, char c, uint16_t fg_color, uint16_t bg_color, uint8_t size);  // ★추가: 문자 하나 그리는 함수
-void LCD_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t fg_color, uint16_t bg_color, uint8_t size);  // ★추가: 문자열 그리는 함수
-void LCD_UpdateStatus(void);                // ★추가: 거리/속도/경고상태를 화면에 표시하는 함수
+void LCD_DrawChar(uint16_t x, uint16_t y, char c, uint16_t fg_color, uint16_t bg_color, uint8_t size);  // 문자 하나 그리는 함수
+void LCD_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t fg_color, uint16_t bg_color, uint8_t size);  // 문자열 그리는 함수
+void LCD_UpdateStatus(void);                // 거리/속도/경고상태를 화면에 표시하는 함수
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -251,53 +230,46 @@ int main(void)
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_DMA(&huart1, (uint8_t*)radar_dma_buf, RADAR_DMA_BUF_SIZE);  // ★변경: USART1(레이더) DMA 순환수신 시작 (기존 인터럽트 방식 → DMA로 교체, overrun 문제 해결용)
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // 부저 PWM 출력 시작 (소리 나기 시작)
-  HAL_Delay(250);                           // 3000밀리초(3초) 동안 여기서 그냥 멈춰서 기다림 (다른 아무것도 안 하고 순수하게 대기)
-  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);   // 3초 지났으니 PWM 출력 정지 (소리 끊김)
+  HAL_UART_Receive_DMA(&huart1, (uint8_t*)radar_dma_buf, RADAR_DMA_BUF_SIZE);  // USART1(레이더) DMA 순환수신 시작
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // 부저 PWM 출력 시작 (전원 인가 알림음)
+  HAL_Delay(250);                           // 250ms 대기
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);   // 부저 정지
   HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2(Pi)에서도 1바이트씩 받는 인터럽트 수신 시작
-  HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);      // ★추가: USART3(ELM327/HC-05) 인터럽트 수신 시작 — 이게 빠져있어서
-                                                              // 배선/페어링/시동 다 정상이어도 E:L에서 고정되던 버그의 원인이었음
-                                                              // (콜백 안에서는 재무장만 하고 있어서, 최초 1회 무장이 없으면 영원히 안 들어옴)
+  HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);      // USART3(ELM327/HC-05) 인터럽트 수신 시작
+                                                              // (콜백에서는 재무장만 하므로 최초 1회 무장이 꼭 필요함)
   LCD_Init();                                 // LCD 초기 설정 명령어들을 순서대로 전송
   HAL_Delay(100);                             // 초기화 안정화를 위해 잠깐 대기
-  LCD_FillScreen(0x0000);                     // ★변경: 검증 끝났으니 진단용 초록화면 대신 검정 배경으로 시작 (이제 그 위에 거리/속도/경고 텍스트를 그림)
+  LCD_FillScreen(0x0000);                     // 검정 배경으로 시작 (이후 그 위에 거리/속도/경고 텍스트를 그림)
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)                                  // 전원이 켜져있는 동안 무한히 반복되는 메인 루프의 시작
-  {                                           // while 루프의 코드 블록 시작 중괄호
-      RadarProcessDmaBuffer();               // ★추가: DMA 순환버퍼에 새로 들어온 레이더 바이트들을 매 루프마다 즉시 처리 (버퍼 넘치기 전에 자주 불러줘야 함)
-      ELM327_RequestSpeed();                 // ★복구: 매 반복마다 ELM327에게 "지금 속도 알려줘" 명령 전송 (내 차 절대속도 요청)
-      // ★참고: 예전 코드는 "HAL_Delay(67); // 200ms 의도"였는데, 그때는 클럭이 실제로는 3배 느리게 돌고 있어서
-      // 67ms를 실행하면 실제로는 약 200ms가 흘렀던 것 (67 × 3.125 ≈ 209ms). 즉 클럭 버그를 역이용해 값을 줄여서 보정해뒀던 것.
-      // 이제 클럭이 정확해졌으니 그 보정이 필요 없음 → 진짜 200ms(=10ms×20)로 되돌림
-      for (uint8_t _w = 0; _w < 20; _w++)    // 10ms씩 20번(총 200ms) 나눠서 기다리며 (블루투스 왕복+ELM327 응답 처리시간 확보)
+  while (1)                                  // 메인 루프
+  {
+      RadarProcessDmaBuffer();               // DMA 순환버퍼에 새로 들어온 레이더 바이트를 매 루프마다 즉시 처리
+      ELM327_RequestSpeed();                 // 매 반복마다 ELM327에게 속도 요청 명령 전송
+      for (uint8_t _w = 0; _w < 20; _w++)    // 10ms씩 20번(총 200ms) 나눠서 기다림 (블루투스 왕복+ELM327 응답 처리시간 확보)
       {
           HAL_Delay(10);                       // 10ms 대기
           RadarProcessDmaBuffer();             // 그 사이사이 레이더 DMA버퍼도 계속 비워줌 (안 그러면 200ms 동안 못 비워서 놓칠 수 있음)
       }
-      if (line_ready)                        // line_ready 깃발이 1(완성됨)인지 확인하는 조건문 시작
-      {                                       // if문 코드 블록 시작 중괄호
+      if (line_ready)                        // 한 줄 완성됐으면
+      {
           int speed = ParseSpeedResponse((const char*)rx_line);
-          // rx_line에 쌓인 문자열을 파싱 함수에 넘겨서 결과를 speed라는 지역변수에 저장
-          if (speed >= 0) // 파싱 결과가 0 이상(=에러 아님, 유효한 값)인지 확인하는 조건문
-          {  // 이 조건이 참일 때 실행될 블록 시작 중괄호
-              last_speed_kmh = speed;         // 유효한 값이므로 전역변수 last_speed_kmh에 이번 속도값을 저장(갱신)
-              elm_data_valid = 1;             // ★추가(디버그용): ELM327 응답을 실제로 정상 파싱했다는 표시
-          }                                   // if (speed >= 0) 블록 끝
-          // (참고: ELM327 속도 수신 확인용 부저는 뺐음 — 어차피 UpdateAnomalyJudgement()가 이상 감지시 부저를 울리므로,
-          //  ELM327 응답마다 매번 삑거리면 그 소리랑 겹쳐서 헷갈림. 필요하면 나중에 LED 등 다른 표시로 대체 고려)
-          line_ready = 0;                    // 이번 응답 처리를 다 끝냈으므로 깃발을 다시 0(대기 상태)으로 내림
-          rx_index = 0;                      // 다음 번 응답을 처음 칸부터 새로 채울 수 있도록 인덱스를 0으로 초기화
-      }                                       // if (line_ready) 블록 끝
-      if (radar_frame_ready)                 // 레이더 프레임이 완성됐는지 확인하는 조건문
-          {                                       // 조건 블록 시작
+          if (speed >= 0) // 파싱 성공(유효값)이면
+          {
+              last_speed_kmh = speed;         // 전역변수에 이번 속도값 저장
+              elm_data_valid = 1;             // ELM327 응답을 한 번이라도 정상 파싱했다는 표시
+          }
+          
+          line_ready = 0;                    
+          rx_index = 0;                      // 인덱스 초기화
+      }
+      if (radar_frame_ready)                 // 레이더 프레임이 완성됐으면
+          {
               ParseRadarFrame();                 // 완성된 프레임을 해석하는 함수 호출 (결과는 전역변수에 저장됨)
-              radar_frame_ready = 0;             // 처리 끝났으니 깃발을 다시 내림
-              // (상태기계가 알아서 처음 상태로 돌아가므로 radar_index 초기화는 더 이상 필요없음)
-          }                                       // if (radar_frame_ready) 블록 끝
+              radar_frame_ready = 0;             
+          }
       // ===== Pi와 주기적으로 데이터 주고받기 =====
           if (HAL_GetTick() - last_pi_send_tick >= 200)          // 200ms마다 한 번씩 (레이더 데이터 갱신 주기와 맞춤)
           {
@@ -306,42 +278,39 @@ int main(void)
           }
           if (pi_line_ready)                                      // Pi로부터 한 줄(응답)이 다 도착했으면
           {
-              pi_total_lines++;                                   // ★추가(디버그용): 뭐가 됐든 한 줄 받을 때마다 카운트
-              // ★변경: Pi가 이제 두 종류의 메시지를 보냄 → 첫 글자로 구분해서 처리
-              //   "B,..." = 밝기델타/이상여부 (기존, 이상감지 로직에 실제로 쓰임)
-              //   "C,..." = 지금 카메라가 차를 검출했는지 여부 (★추가, LCD 표시 전용, 판정 로직엔 영향 없음)
+              pi_total_lines++;                                   // 한 줄 받을 때마다 카운트 (통신 확인용)
+              // Pi가 두 종류 메시지를 보냄 → 첫 글자로 구분
+              //   "B,..." = 밝기델타/이상여부 (이상감지 로직에 실제로 쓰임)
+              //   "C,..." = 지금 카메라가 차를 검출했는지 여부 (LCD 표시 전용, 판정 로직엔 영향 없음)
               if (pi_rx_line[0] == 'B')
               {
-                  Pi_ParseBrightnessResponse((const char*)pi_rx_line); // 그 응답을 파싱해서 pi_brightness_delta, pi_anomaly_flag에 저장 (★검증 끝: STM32<->Pi B, 파싱 정상 확인됨)
+                  Pi_ParseBrightnessResponse((const char*)pi_rx_line); // 파싱해서 pi_brightness_delta, pi_anomaly_flag에 저장
               }
               else if (pi_rx_line[0] == 'C')
               {
-                  Pi_ParseCameraStatus((const char*)pi_rx_line);       // ★추가: 카메라 검출상태 파싱해서 cam_detected에 저장
+                  Pi_ParseCameraStatus((const char*)pi_rx_line);       // 카메라 검출상태 파싱해서 cam_detected에 저장
               }
-              pi_line_ready = 0;                                  // 처리 끝났으니 깃발 내림
-              pi_rx_index = 0;                                    // 다음 줄 받을 준비
+              pi_line_ready = 0;                                  
+              pi_rx_index = 0;                                    
           }
           // ===== 판정 로직 실행 =====
-          UpdateFrontCarSpeed();                                  // ★복구: 레이더+내차속도로 앞차 절대속도 계산 및 이력 저장
-          UpdateAnomalyJudgement();                                // ★복구: 감속여부+밝기이상여부 종합해서 최종 판정 (이상 감지시 부저 울림)
+          UpdateFrontCarSpeed();                                  // 레이더+내차속도로 앞차 절대속도 계산 및 이력 저장
+          UpdateAnomalyJudgement();                                // 감속여부+밝기이상여부 종합해서 최종 판정 (이상 감지시 부저 울림)
 
-          // ===== ★추가: 디스플레이에 거리/속도/경고상태 표시 =====
+          // ===== 디스플레이에 거리/속도/경고상태 표시 =====
           {
               static uint32_t last_lcd_update_tick = 0;             // 마지막으로 화면 갱신한 시각(ms)
-              if (HAL_GetTick() - last_lcd_update_tick >= 100)        // ★변경: 300→100ms — 어차피 메인루프 자체가 ELM327 응답 대기 때문에
-                                                                        // 한 바퀴에 최소 200ms 걸리니, 100ms로 낮추면 매 루프마다 빠짐없이
-                                                                        // 갱신됨(이전엔 300ms라 루프 한두 번씩 건너뛰어서 체감상 더 느렸음)
+              if (HAL_GetTick() - last_lcd_update_tick >= 100)        // 100ms마다 갱신 (메인루프 한 바퀴가 최소 200ms라 매 루프 빠짐없이 갱신됨)
               {
                   LCD_UpdateStatus();                                   // 거리/속도/경고문구를 화면에 그림
                   last_lcd_update_tick = HAL_GetTick();
               }
           }
-          // ===== 디스플레이 갱신 끝 =====
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }                                           // while(1) 루프 블록 끝 (실제로는 무한루프라 여기 도달 후 다시 맨 위로)
+  }                                           // while(1) 루프 끝 
   /* USER CODE END 3 */
 }
 
@@ -485,7 +454,7 @@ static void MX_USART1_UART_Init(void)
   /* USER CODE BEGIN USART1_Init 1 */
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;           // ★변경: .ioc 재생성 과정에서 9600으로 되돌아갔던 것을 다시 115200으로 수정함 (HLK-LD2451 실제 baudrate)
+  huart1.Init.BaudRate = 115200;           // HLK-LD2451 baudrate
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -619,20 +588,18 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-// ★추가: UART 수신 중 에러(overrun 등)가 나면 HAL이 인터럽트 수신을 자동으로 재시작 안 하고 멈춰버리기 때문에,
-// 에러 콜백에서 직접 다시 무장(re-arm)해줘야 함. 이거 없으면 에러 한 번만 나도 그 채널 수신이 영구히 멈춤.
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    __HAL_UART_CLEAR_OREFLAG(huart);   // Overrun 에러 플래그 클리어 (안 지우면 계속 에러 상태로 남아있을 수 있음)
+    __HAL_UART_CLEAR_OREFLAG(huart);   // Overrun 에러 플래그 클리어
     __HAL_UART_CLEAR_NEFLAG(huart);    // Noise 에러 플래그 클리어
     __HAL_UART_CLEAR_FEFLAG(huart);    // Framing 에러 플래그 클리어
     __HAL_UART_CLEAR_PEFLAG(huart);    // Parity 에러 플래그 클리어
 
-    if (huart->Instance == USART1)                              // 레이더 채널이면 (★변경: DMA 방식이라 재시작도 DMA로)
+    if (huart->Instance == USART1)                              // 레이더 채널이면 (DMA 방식이라 재시작도 DMA로)
     {
         radar_state = RADAR_WAIT_HEADER;                          // 상태기계도 처음부터 다시 시작하도록 리셋
         radar_header_match = 0;
-        radar_dma_last_pos = 0;                                    // DMA 버퍼 읽기 위치도 초기화
+        radar_dma_last_pos = 0;                                    // DMA 버퍼 읽기 위치 초기화
         HAL_UART_Receive_DMA(&huart1, (uint8_t*)radar_dma_buf, RADAR_DMA_BUF_SIZE);  // DMA 순환수신 재시작
     }
     else if (huart->Instance == USART2)                         // Pi 채널이면
@@ -645,40 +612,37 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     }
 }
 
-void ELM327_RequestSpeed(void)             // 속도 요청 명령을 보내는 함수의 실제 내용(구현) 시작
-{                                           // 함수 블록 시작 중괄호
-    uint8_t cmd[] = "010D\r"; // 전송할 명령 문자열을 담은 배열: OBD-II Mode01+PID0D(속도 요청)+캐리지리턴
-    HAL_UART_Transmit(&huart3, cmd, sizeof(cmd) - 1, 100);
-                                            // USART3로 cmd 배열을 전송 / sizeof(cmd)-1: 문자열 끝 널문자는 제외한 실제 길이 / 100: 타임아웃(ms)
-}                                           // ELM327_RequestSpeed 함수 블록 끝
-int ParseSpeedResponse(const char *raw)    // 응답 문자열을 파싱하는 함수의 실제 내용 시작, raw는 파싱할 원본 문자열
-{                                           // 함수 블록 시작 중괄호
-    const char *p = strstr(raw, "41 0D");  // raw 문자열 안에서 "41 0D"(공백 포함 버전)가 어디서 시작하는지 찾아 그 위치를 p에 저장
-    if (p == NULL)                         // "41 0D"를 못 찾았을 경우(NULL이 반환됨)를 확인하는 조건문
-    {                                       // 이 조건 블록 시작
-        p = strstr(raw, "410D");           // 공백 없이 붙어서 오는 "410D" 버전도 찾아봄
-        if (p == NULL) return -1;          // 그마저도 없으면 이 응답엔 속도 데이터가 없다는 뜻이므로 즉시 -1(에러) 반환하고 함수 종료
-        p += 4;                            // "410D" 네 글자만큼 포인터를 이동시켜, 그 바로 뒤(값이 시작될 위치)를 가리키게 함
-    }                                       // if (p == NULL) 블록 끝
-    else                                    // "41 0D"를 (공백 버전으로) 찾은 경우
-    {                                       // else 블록 시작
-        p += 5;                            // "41 0D" 다섯 글자(공백 포함)만큼 포인터를 이동시켜 값 위치로 이동
-    }                                       // else 블록 끝
-    while (*p == ' ') p++;                 // p가 가리키는 곳에 공백이 남아있는 동안 계속 한 칸씩 앞으로 이동(공백 건너뛰기)
-    unsigned int value;                    // 16진수를 변환해서 담을 부호없는 정수 변수를 선언
-    if (sscanf(p, "%2x", &value) != 1) return -1;
-                                            // p 위치부터 16진수 2자리를 읽어 value에 저장 시도, 실패(읽은 개수가 1이 아니면)하면 -1 반환
-    return (int)value;                     // 성공적으로 읽은 value를 정수로 형변환해서 최종 반환
-}                                           // ParseSpeedResponse 함수 블록 끝
+void ELM327_RequestSpeed(void)             // 속도 요청 명령을 보내는 함수
+{
+    uint8_t cmd[] = "010D\r"; 
+    HAL_UART_Transmit(&huart3, cmd, sizeof(cmd) - 1, 100);  
+}
+int ParseSpeedResponse(const char *raw)    // ELM327 응답 문자열을 파싱해서 속도값(정수)으로 변환, 실패시 -1
+{
+    const char *p = strstr(raw, "41 0D");  // "41 0D"(공백 포함) 위치 탐색
+    if (p == NULL)
+    {
+        p = strstr(raw, "410D");           // 공백 없이 붙어서 오는 버전도 확인
+        if (p == NULL) return -1;          // 둘 다 없으면 속도 데이터 없는 응답
+        p += 4;                            // "410D" 다음(값 시작 위치)으로 이동
+    }
+    else
+    {
+        p += 5;                            // "41 0D" 다음(값 시작 위치)으로 이동
+    }
+    while (*p == ' ') p++;                 // 공백 건너뛰기
+    unsigned int value;
+    if (sscanf(p, "%2x", &value) != 1) return -1;  // 16진수 2자리 파싱 실패시 -1
+    return (int)value;
+}
 
-// ★추가: 레이더 바이트 하나를 상태기계에 넣어서 처리하는 함수
-// (예전엔 USART1 인터럽트 안에서 바로 처리했지만, DMA 방식으로 바꾸면서 메인루프가 DMA버퍼를 읽으며 이 함수를 호출하는 구조로 변경)
+// 레이더 바이트 하나를 상태기계에 넣어서 처리하는 함수 (DMA버퍼를 메인루프가 읽으며 호출)
 void RadarProcessByte(uint8_t b)
 {
-    radar_raw_byte_count++;              // ★진단용: 헤더가 맞든 안 맞든 상관없이, 바이트가 들어올 때마다 무조건 1 증가
-    if (radar_debug_len < RADAR_DEBUG_BUF_LEN)   // ★진단용: 버퍼에 아직 공간이 남아있으면
+    radar_raw_byte_count++;              // 헤더 매칭 여부와 무관하게 바이트가 들어올 때마다 1 증가
+    if (radar_debug_len < RADAR_DEBUG_BUF_LEN)   // 버퍼에 아직 공간이 남아있으면
     {
-        radar_debug_buf[radar_debug_len++] = b;    // 받은 바이트를 그대로(가공 없이) 디버그 버퍼에 적재
+        radar_debug_buf[radar_debug_len++] = b;    // 받은 바이트를 그대로 디버그 버퍼에 적재
     }
     switch (radar_state)                 // 지금 어느 단계인지에 따라 분기
     {
@@ -699,7 +663,7 @@ void RadarProcessByte(uint8_t b)
             break;
 
         case RADAR_WAIT_LENGTH:                            // 길이필드 2바이트를 받는 중인 단계
-            if (radar_payload_idx == 0)                      // 길이필드의 첫 바이트(하위바이트, 리틀엔디안 가정)
+            if (radar_payload_idx == 0)                      // 길이필드의 첫 바이트(하위바이트)
             {
                 radar_payload_len = b;                         // 하위바이트를 그대로 저장
                 radar_payload_idx = 1;                         // 다음 차례는 상위바이트
@@ -709,7 +673,7 @@ void RadarProcessByte(uint8_t b)
                 radar_payload_len |= ((uint16_t)b << 8);        // 상위바이트를 8비트 왼쪽으로 밀어서 합침
                 if (radar_payload_len > RADAR_MAX_PAYLOAD)       // 비정상적으로 큰 길이값이면(노이즈로 헤더가 우연히 맞은 경우 등)
                 {
-                    radar_state = RADAR_WAIT_HEADER;              // 이 프레임은 버리고 처음부터 헤더 재탐색
+                    radar_state = RADAR_WAIT_HEADER;              // 헤더 재탐색
                     radar_header_match = 0;
                 }
                 else                                              // 정상 범위의 길이값이면
@@ -735,33 +699,33 @@ void RadarProcessByte(uint8_t b)
                 radar_tail_idx++;                                // 일치 카운트 증가
                 if (radar_tail_idx >= RADAR_TAIL_LEN)             // 테일 4바이트가 전부 확인됐으면
                 {
-                    radar_frame_ready = 1;                         // 완전한 프레임 하나 완성! 메인루프에 신호
+                    radar_frame_ready = 1;                         // 완전한 프레임 하나 완성. 메인루프에 신호
                     radar_state = RADAR_WAIT_HEADER;               // 다음 프레임을 위해 처음 상태로 복귀
                     radar_header_match = 0;
                 }
             }
-            else                                                 // 테일이 기대값과 다르면(깨진 프레임)
+            else                                                 // 프레임이 깨져있을 때
             {
                 radar_state = RADAR_WAIT_HEADER;                    // 이번 프레임은 버리고 헤더 재탐색으로 복귀
-                radar_header_match = (b == RADAR_HEADER[0]) ? 1 : 0; // 이 바이트가 다음 프레임의 시작일 수도 있으니 체크
+                radar_header_match = (b == RADAR_HEADER[0]) ? 1 : 0; // 이 바이트가 다음 프레임의 시작인지 체크
             }
             break;
     }
 }
 
-// ★추가: DMA 순환버퍼에 새로 쌓인 바이트들을 메인루프에서 꺼내 하나씩 RadarProcessByte()에 넘겨 처리하는 함수
-// DMA가 하드웨어적으로 계속 radar_dma_buf를 채우고 있으므로, 여기서는 "지금까지 얼마나 채워졌는지" 위치만 계산해서
-// 아직 처리 안 한 구간만 꺼내 쓰면 됨 (원형버퍼라 끝에 도달하면 다시 처음으로 돌아감)
+// DMA 순환버퍼에 새로 쌓인 바이트들을 메인루프에서 꺼내 하나씩 RadarProcessByte()에 넘겨 처리하는 함수
+// DMA가 계속 radar_dma_buf를 채우므로, 여기선 지금까지 채워진 위치만 계산해서 아직 처리 안 한 구간만 꺼내 씀
+// (원형버퍼라 끝에 도달하면 다시 처음으로 돌아감)
 void RadarProcessDmaBuffer(void)
 {
     uint16_t dma_write_pos = RADAR_DMA_BUF_SIZE - __HAL_DMA_GET_COUNTER(huart1.hdmarx);
-    // __HAL_DMA_GET_COUNTER: DMA가 "앞으로 몇 바이트 더 채울 수 있는지(남은 카운트)"를 알려줌
+    // __HAL_DMA_GET_COUNTER: DMA가 남은 카운트를 알려줌
     // 전체 버퍼크기에서 그 남은 카운트를 빼면, 지금까지 DMA가 실제로 채워넣은 위치(인덱스)가 나옴
 
     while (radar_dma_last_pos != dma_write_pos)          // 아직 처리 안 한 새 바이트가 있는 동안 계속 반복
     {
         RadarProcessByte(radar_dma_buf[radar_dma_last_pos]);  // 그 위치의 바이트를 상태기계로 처리
-        radar_dma_last_pos = (radar_dma_last_pos + 1) % RADAR_DMA_BUF_SIZE;  // 다음 위치로 이동 (끝에 닿으면 0으로 순환)
+        radar_dma_last_pos = (radar_dma_last_pos + 1) % RADAR_DMA_BUF_SIZE;  // 다음 위치로 이동
     }
 }
 
@@ -781,21 +745,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
         HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);
     }
-    // ★변경: USART1(레이더)은 이제 DMA 순환수신 방식이라 여기서 바이트 단위로 처리하지 않음
-    // (DMA는 buffer 전체를 다 채워야만 이 콜백이 호출되는데, 우리는 그 전에 메인루프의
-    //  RadarProcessDmaBuffer()에서 이미 다 처리하고 있으므로 이 콜백에서 USART1은 따로 처리할 게 없음)
+    // USART1(레이더)은 DMA 순환수신 방식이라 여기서 바이트 단위로 처리하지 않음
+    // (메인루프의 RadarProcessDmaBuffer()가 이미 처리하므로 이 콜백에서 USART1은 따로 할 일 없음)
     else if (huart->Instance == USART2)      // USART2(Pi)에서 발생한 인터럽트인 경우
     {
         char c = (char)pi_rx_byte;           // 받은 1바이트를 문자로 변환
-        // ★변경(진짜 원인 발견): 예전엔 여기서 pi_line_ready==1이어도 그냥 계속 다음 바이트를 받아버려서,
-        // 메인루프가 아직 이전 줄("B,...")을 다 읽기도 전에 다음 줄("C,...")이 그 위에 덮어써지는
-        // 레이스 컨디션이 있었음. Pi가 "B,"와 "C,"를 프레임마다 연달아 빠르게 보내는데, 메인루프가
-        // LCD 갱신 등으로 잠깐이라도 늦어지면 이게 자주 발생 → sscanf가 깨진 문자열을 읽어서 파싱 실패 →
-        // 파싱 실패하면 pi_anomaly_flag는 "마지막으로 성공했던 값"에 그대로 멈춰있음 → 그게 하필 과거에
-        // 1(밝아짐)로 찍힌 값이었다면, 미등을 꺼놔도 계속 "밝아짐 상태"로 착각해서 WARN이 영원히 안 뜸.
-        // → 메인루프가 이전 줄을 아직 다 못 읽었으면(pi_line_ready==1), 새 바이트를 버퍼에 아예 안 쓰고
-        //   무시함(버림). 최악의 경우 그 한 줄만 스킵되고, 다음 줄부터 다시 정상적으로 받힘 — 덮어쓰기로
-        //   기존 값을 깨뜨리는 것보다 한 줄 스킵이 훨씬 안전함.
+        // 메인루프가 이전 줄("B,...")을 아직 다 못 읽었는데 다음 줄("C,...")이 덮어써지는 경우
+        // → pi_line_ready==1인 동안은 새 바이트를 버퍼에 안 쓰고 그냥 버림
+        
         if (!pi_line_ready)
         {
             if (c == '\n' || c == '\r')          // 줄바꿈 문자를 만나면 (Pi는 파이썬이라 \n을 씀)
@@ -816,7 +773,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         HAL_UART_Receive_IT(&huart2, (uint8_t*)&pi_rx_byte, 1);  // USART2 다음 바이트 재무장
     }
 }
-// ★추가: 5개 값의 중간값(median) 반환 — 연속 2프레임까지 튀는 노이즈도 걸러내기 위한 D(거리) 전용 스무딩
+// 5개 값의 중간값(median) 반환 — 연속 2프레임까지 튀는 노이즈를 걸러내기 위한 스무딩
 static float Median5(float v[5])
 {
     float a[5]; for (uint8_t i = 0; i < 5; i++) a[i] = v[i];    // 원본 순서 보존을 위해 복사본에서 정렬
@@ -838,24 +795,23 @@ void ParseRadarFrame(void)
 
     uint8_t target_count = radar_payload_buf[0];           // 페이로드 첫 바이트 = 이번 프레임에 포함된 타겟 개수
 
-    if (target_count == 0 || target_count > RADAR_MAX_TARGET)  // 타겟이 0개(아무것도 없음)거나 비정상적으로 많으면
+    if (target_count == 0 || target_count > RADAR_MAX_TARGET)  // 타겟이 0개거나 비정상적으로 많으면
     {
         radar_distance_m = -1.0f;                            // "유효한 타겟 없음" 상태로 표시해둠
-        radar_track_distance_m = -1.0f;                       // ★추가: 타겟이 사라졌으니 트랙(연속성)도 리셋 — 다음에 나타나는 건 새 차일 수 있으므로
-        radar_hist_count = 0;                                 // ★추가: median 버퍼도 리셋 (끊긴 값을 다음 차 값이랑 섞어서 중간값 내면 안 되니까)
-        radar_dist_hist_count = 0;                            // ★추가: 거리 median 버퍼(5개)도 같이 리셋
-        return;                                                // 더 처리할 게 없으므로 함수 종료
+        radar_track_distance_m = -1.0f;                       // 타겟이 사라졌으니 트랙(연속성)도 리셋 — 다음 타겟은 새 차일 수 있음
+        radar_hist_count = 0;                                 // median 버퍼도 리셋 (끊긴 값을 다음 차 값과 섞으면 안 되니까)
+        radar_dist_hist_count = 0;                            // 거리 median 버퍼도 같이 리셋
+        return;
     }
 
     // 필요한 총 바이트수(타겟개수 1바이트 + 타겟당 6바이트*개수)가 실제 받은 페이로드 길이와 맞는지 확인
     uint16_t expected_len = 1 + (uint16_t)target_count * RADAR_TARGET_SZ;
     if (expected_len > radar_payload_len) return;            // 길이가 안 맞으면(깨진 데이터일 가능성) 그냥 무시하고 종료
 
-    // ★변경: "각도가 0에 가장 가까운 타겟"만으로 고르던 방식은, 매 프레임 독립적으로 다시 고르다 보니
-    // 각도가 비슷한 서로 다른 물체(옆차/도로 옆 구조물 등) 사이에서 완전히 튀어버리는 문제가 있었음
-    // (실측: 거리값이 2m → 47m 처럼 순간이동. 같은 차라면 절대 그렇게 못 바뀜)
-    // → 1순위: "이전 프레임에서 추적하던 거리값과 비슷한(±RADAR_TRACK_GATE_M 이내) 타겟"을 최우선으로 선택 (연속성 유지)
-    //    2순위: 그런 후보가 없으면(트랙이 없거나, 진짜로 새 차가 나타난 경우) 기존 방식(각도 0에 최소)으로 재탐색
+    // 타겟 선택: 매 프레임 "각도가 0에 가장 가까운 타겟"만으로 고르면, 각도가 비슷한 서로 다른 물체
+    // (옆차/도로 옆 구조물) 사이에서 튀는 문제 (실측: 거리값 2m→47m처럼 순간이동)
+    //   1순위: 이전 프레임에서 추적하던 거리값과 비슷한(±RADAR_TRACK_GATE_M 이내) 타겟을 최우선 선택 (연속성 유지)
+    //   2순위: 그런 후보가 없으면(트랙 없음 또는 새 차) 각도 0에 가장 가까운 타겟으로 재탐색
     uint8_t best_idx = 0xFF;                                  // 0xFF = 아직 못 찾음
     if (radar_track_distance_m >= 0.0f)                       // 이전에 추적하던 거리값(트랙)이 있으면
     {
@@ -863,7 +819,7 @@ void ParseRadarFrame(void)
         for (uint8_t i = 0; i < target_count; i++)
         {
             const volatile uint8_t *ti = &radar_payload_buf[1 + i * RADAR_TARGET_SZ];
-            float dist_i = (float)ti[2];                        // 이 타겟의 원시 거리값(m)
+            float dist_i = (float)ti[2];                        // 이 타겟의 거리값(m)
             float diff = dist_i - radar_track_distance_m;
             if (diff < 0) diff = -diff;                          // 절대값
             if (diff <= RADAR_TRACK_GATE_M && diff < best_diff)   // 게이트 안이면서 지금까지 중 가장 가까우면
@@ -881,8 +837,7 @@ void ParseRadarFrame(void)
             const volatile uint8_t *ti = &radar_payload_buf[1 + i * RADAR_TARGET_SZ];
             int16_t angle_i = (int16_t)ti[1] - 0x80;
             int16_t abs_angle_i = (angle_i < 0) ? -angle_i : angle_i;
-            if (abs_angle_i > RADAR_ANGLE_GATE_DEG) continue;     // ★추가: 각도 게이트 — 너무 삐딱한(정면에서 크게 벗어난)
-                                                                    // 물체는 아예 후보에서 제외 (부채꼴 오탐 방지)
+            if (abs_angle_i > RADAR_ANGLE_GATE_DEG) continue;     // 각도 게이트 — 정면에서 크게 벗어난 물체는 후보 제외 (부채꼴 오탐 방지)
             if (abs_angle_i < best_abs_angle)
             {
                 best_abs_angle = abs_angle_i;
@@ -890,8 +845,8 @@ void ParseRadarFrame(void)
             }
         }
     }
-    if (best_idx == 0xFF)                                     // ★추가: 각도 게이트 때문에 후보가 하나도 없으면(전방에 아무것도 없음)
-    {                                                           // "유효한 타겟 없음"으로 처리하고 이번 프레임은 그냥 종료
+    if (best_idx == 0xFF)                                     // 각도 게이트 때문에 후보가 하나도 없으면(전방에 아무것도 없음)
+    {                                                           // "유효한 타겟 없음"으로 처리하고 종료
         radar_distance_m = -1.0f;
         radar_track_distance_m = -1.0f;
         radar_hist_count = 0;
@@ -907,17 +862,14 @@ void ParseRadarFrame(void)
     uint8_t speed_raw      = t[4];                              // 속도(km/h, 최대 120)
     uint8_t snr            = t[5];                              // 신호대잡음비(0~255) — 지금은 안 쓰지만 나중에 신뢰도 필터링용
 
-    radar_track_distance_m = (float)distance_m_raw;            // ★추가: 다음 프레임 연속성 판단 기준으로 "이번에 고른 원시 거리"를 저장
+    radar_track_distance_m = (float)distance_m_raw;            // 다음 프레임 연속성 판단 기준으로 이번 원시 거리를 저장
 
     float raw_distance_m = (float)distance_m_raw;
-    // ★변경(실차 데이터로 확인된 버그 fix): 거리(D)가 실제로 늘어나는데(멀어지는데)도 S가 계속 음수로
-    // 나온다는 게 실측으로 확인됨 → speed_dir 부호 가정이 반대였음. 그래서 조건을 반전시킴.
+    // speed_dir==0x01이면 멀어짐(양수), 아니면 가까워짐(음수) — 실측으로 부호 방향 확인해서 반영
     float raw_speed_kmh  = (speed_dir == 0x01) ? (float)speed_raw : -(float)speed_raw;
-                                                                  // 이제 speed_dir==0x01이면 멀어짐(양수), 아니면 가까워짐(음수)
                                                                   // (UpdateFrontCarSpeed에서 "양수=멀어짐" 가정과 맞춤)
 
-    // ★변경: D(거리), S(속도) 둘 다 median-of-5 — S도 실차에서 튀는 게 확인돼서 정확성 우선으로 통일
-    // (완전히 다른 물체로 튀는 문제는 위의 트랙 연속성+각도게이트 로직이 막아주고, 이건 그 다음 단계의 잔여 노이즈 제거용)
+    // D(거리), S(속도) 둘 다 median-of-5로 스무딩 — 트랙 연속성+각도게이트가 튐은 막아주고 잔여 노이즈 제거용
     radar_dist_hist[radar_dist_hist_idx] = raw_distance_m;
     radar_dist_hist_idx = (radar_dist_hist_idx + 1) % 5;
     if (radar_dist_hist_count < 5) radar_dist_hist_count++;
@@ -932,13 +884,12 @@ void ParseRadarFrame(void)
     radar_angle_deg  = (int8_t)angle_raw;                       // 각도 저장 (스무딩 없이 그대로 — 표시/게이팅용으로만 쓰여서 큰 영향 없음)
 
     (void)alarm_info; (void)snr;                                // 아직 안 쓰는 값들이라 컴파일 경고 방지용으로 캐스팅
-    // ★제거: 프레임 파싱 성공시 삑거리던 테스트용 부저 삭제함 (검증 끝났고, UpdateAnomalyJudgement()가 실제 이상감지 부저를 담당하므로 여기서 건드리면 소리가 겹침)
 }
 // STM32가 Pi에게 레이더 데이터를 보내는 함수
 void Pi_SendRadarData(void)
 {
     char msg[48];                            // 보낼 메시지를 담을 임시 문자 배열
-    // ★변경: 각도값도 같이 보내줌 (Pi에서 레이더 각도 → 카메라 화면 픽셀 위치로 변환해서 ROI를 좁히는 데 씀)
+    // 각도값도 같이 보내줌 (Pi에서 레이더 각도 → 카메라 화면 픽셀 위치로 변환해서 ROI를 좁히는 데 씀)
     int len = snprintf(msg, sizeof(msg), "R,%.1f,%.1f,%d\r\n", radar_distance_m, radar_speed_kmh, (int)radar_angle_deg);
     // "R,거리,상대속도,각도\r\n" 형식의 문자열을 만듦, snprintf는 printf처럼 포맷팅해서 문자열로 만들어줌
     // %.1f는 소수점 첫째자리까지 표시하라는 뜻
@@ -965,8 +916,8 @@ int Pi_ParseBrightnessResponse(const char *raw)
     pi_data_valid = 1;                       // "유효한 Pi 데이터를 받은 적 있다"고 표시
     return 0;                                // 성공 반환
 }
-// ★추가: Pi가 매 프레임 보내는 "C,검출여부"(지금 카메라가 차를 보고 있는지)를 파싱하는 함수
-// (이상감지 판정 로직에는 전혀 관여하지 않고, LCD 표시 전용으로만 씀)
+// Pi가 매 프레임 보내는 "C,검출여부"(카메라가 지금 차를 보고 있는지)를 파싱하는 함수
+// (이상감지 판정 로직에는 관여하지 않고 LCD 표시 전용으로만 씀)
 int Pi_ParseCameraStatus(const char *raw)
 {
     if (raw[0] != 'C' || raw[1] != ',')     // "C,"로 시작하지 않으면 형식 에러
@@ -979,8 +930,8 @@ int Pi_ParseCameraStatus(const char *raw)
     {
         return -1;
     }
-    cam_detected = (uint8_t)detected_val;    // 전역변수에 저장 (LCD_UpdateStatus에서 표시함)
-    pi_cam_msgs++;                           // ★추가(디버그용): C, 파싱 성공 횟수 카운트
+    cam_detected = (uint8_t)detected_val;    // 전역변수 저장, LCD_UpdateStatus에서 표시
+    pi_cam_msgs++;                           // C, 파싱 성공 횟수 카운트
     return 0;
 }
 // 레이더의 상대속도 + 내 차 절대속도(ELM327)를 결합해서 앞차 절대속도를 계산하고 이력에 저장하는 함수
@@ -990,7 +941,7 @@ void UpdateFrontCarSpeed(void)
     {
         return;                              // 계산 불가능하므로 그냥 함수 종료 (아무것도 안 함)
     }
-    // TODO: 아래 부호 관계는 레이더 실물 데이터로 검증 후 필요시 수정
+   
     // radar_speed_kmh: 양수=멀어짐, 음수=가까워짐 (radar_parser.py 설계 기준)
     front_car_speed_kmh = (float)last_speed_kmh + radar_speed_kmh;
     // 내 차 속도에 레이더가 알려준 상대속도를 더해서 앞차의 절대속도를 역산
@@ -1002,14 +953,14 @@ void UpdateFrontCarSpeed(void)
         history_count++;                     // 쌓인 개수를 하나 늘림
     }
 }
-// ★추가: 히스테리시스 상태(0=OFF, 1=ON) — 함수 호출 사이에 계속 유지되어야 하므로 static
+// 히스테리시스 상태(0=OFF, 1=ON) — 함수 호출 사이에 유지되어야 하므로 static
 static uint8_t decel_hysteresis_state = 0;
 // 최근 이력을 보고 "지금 앞차가 감속 중인지"를 판정하는 함수 (히스테리시스 적용)
 uint8_t CheckDeceleration(void)
 {
     if (history_count < 2)                   // 비교할 만큼 이력이 충분히 쌓이지 않았으면
     {
-        decel_hysteresis_state = 0;          // ★추가: 데이터 자체가 부족한 상황이니 안전하게 OFF로 리셋
+        decel_hysteresis_state = 0;          // 데이터 자체가 부족하니 OFF로
         return 0;                            // 판단 불가, 감속 아님으로 처리
     }
     uint32_t now = HAL_GetTick();            // 현재 시각
@@ -1018,7 +969,7 @@ uint8_t CheckDeceleration(void)
     for (uint8_t i = 0; i < history_count; i++)  // 저장된 이력을 하나씩 순회
     {
         uint8_t idx = (history_index + SPEED_HISTORY_LEN - 1 - i) % SPEED_HISTORY_LEN;
-        // 제일 최근 것부터 거꾸로 순서대로 인덱스를 계산 (원형버퍼 역순 탐색)
+        // 제일 최근 것부터 거꾸로 순서대로 인덱스 계산
         uint32_t age_ms = now - front_speed_history[idx].tick;  // 그 샘플이 얼마나 오래된 것인지(ms)
         if (age_ms >= DECEL_WINDOW_MS)       // 설정한 비교 시간창(예: 1000ms)보다 오래된 샘플을 찾으면
         {
@@ -1029,11 +980,10 @@ uint8_t CheckDeceleration(void)
     }
     if (!found_old_sample)                    // 시간창만큼 오래된 샘플을 못 찾았으면 (아직 데이터가 부족)
     {
-        decel_hysteresis_state = 0;          // ★추가: 마찬가지로 데이터 부족 상황이니 안전하게 OFF로 리셋
+        decel_hysteresis_state = 0;          // 마찬가지로 데이터 부족이니 안전하게 OFF
         return 0;                            // 판단 불가, 감속 아님으로 처리
     }
     float speed_drop = oldest_speed_in_window - front_car_speed_kmh;  // 예전속도 - 현재속도 = 감속한 정도
-    // ★변경: 단일 임계값 대신 히스테리시스 적용
     if (speed_drop >= DECEL_THRESHOLD_KMH)           // 진입기준(4.0) 이상이면 확실히 ON
     {
         decel_hysteresis_state = 1;
@@ -1042,7 +992,7 @@ uint8_t CheckDeceleration(void)
     {
         decel_hysteresis_state = 0;
     }
-    // else: 2.5~4.0 사이(회색지대)는 이전 상태를 그대로 유지 — 여기가 히스테리시스의 핵심
+    // else: 2.5~4.0 사이(회색지대)는 이전 상태를 그대로 유지 — 히스테리시스
     return decel_hysteresis_state;
 }
 // 감속여부 + 밝기이상여부를 종합해서 최종 "제동등 이상" 판정을 내리는 함수
@@ -1056,29 +1006,27 @@ void UpdateAnomalyJudgement(void)
         // pi_anomaly_flag가 0(정상, 즉 밝기변화 없음)이면 "제동등이 안 켜진 것"으로 해석
         // (pi_anomaly_flag=1이면 Pi가 이미 "밝아짐" 감지했다는 뜻이므로 이 경우는 문제 없음)
     }
-    dbg_brake_missing = brake_light_missing;  // ★추가(디버그용): 이번 판정 결과를 그대로 저장 (LCD 표시용)
+    dbg_brake_missing = brake_light_missing;  // 이번 판정 결과를 그대로 저장 (LCD 표시용)
     if (is_decelerating && brake_light_missing)  // 감속 중인데 + 제동등은 안 켜진 것으로 보이면 (모순 상황)
     {
         if (anomaly_start_tick == 0)          // 이 모순 상황이 방금 막 시작된 거라면 (아직 시작시각 기록 안 됨)
         {
             anomaly_start_tick = HAL_GetTick();  // 지금 시각을 "이상 의심 시작 시각"으로 기록
         }
-        anomaly_last_true_tick = HAL_GetTick();  // ★추가: 방금 조건이 참이었다고 기록 (grace period 계산 기준)
+        anomaly_last_true_tick = HAL_GetTick();  // 방금 조건이 참이었다고 기록 (grace period 계산 기준)
         if (HAL_GetTick() - anomaly_start_tick >= ANOMALY_PERSIST_MS)
         // 이 모순 상황이 시작된 후로 설정한 지속시간(예: 500ms) 이상 계속됐으면
         {
             anomaly_confirmed = 1;            // 최종적으로 "이상"이라고 확정
         }
     }
-    else                                       // 감속 중이 아니거나, 제동등이 정상으로 보이면 (모순 상황 해소로 "보일" 수 있음)
+    else                                       
     {
-        // ★변경: 예전엔 여기서 바로 리셋했는데, 프레임 한두 개만 순간적으로 조건 벗어나도(노이즈)
-        // 카운트가 매번 0부터 다시 시작돼서 실제 지속 이상상황도 WARN까지 못 가는 문제가 있었음
-        // → anomaly_start_tick이 이미 설정된 상태에서, 마지막으로 조건이 참이었던 시점으로부터
-        //   ANOMALY_GRACE_MS(300ms) 이내면 "일시적 끊김"으로 보고 카운트를 안 끊음
+        // 실제 지속 이상상황도 WARN까지 못 가는 문제
+        // → 마지막으로 조건이 참이었던 시점으로부터 300ms 이내면 일시적 끊김으로 보고 카운트 유지
         if (anomaly_start_tick != 0 && (HAL_GetTick() - anomaly_last_true_tick) < ANOMALY_GRACE_MS)
         {
-            // 카운트 유지 (start_tick도, confirmed 상태도 안 건드림) — grace period 안이므로 계속 지속중인 걸로 취급
+            // 카운트 유지 grace period 안이므로 계속 지속중인 걸로 취급
         }
         else
         {
@@ -1086,8 +1034,7 @@ void UpdateAnomalyJudgement(void)
             anomaly_confirmed = 0;                // 이상 확정 상태도 해제
         }
     }
-    // ★추가(디버그용): 지금 "감속+제동등꺼짐" 모순이 몇 ms째 지속중인지 계산해서 LCD로 보여줄 수 있게 저장
-    // (anomaly_start_tick이 0이면 지금은 모순 상황이 아니라는 뜻이므로 0으로 표시)
+    // 지금 "감속+제동등꺼짐" 모순이 몇 ms째 지속중인지 계산해서 LCD로 표시 (0이면 모순 아님)
     dbg_anomaly_ms = (anomaly_start_tick != 0) ? (HAL_GetTick() - anomaly_start_tick) : 0;
     if (anomaly_confirmed)                    // 최종적으로 이상이 확정된 상태면
     {
@@ -1106,18 +1053,18 @@ void LCD_Reset(void)
     HAL_GPIO_WritePin(LCD_RES_GPIO_Port, LCD_RES_Pin, GPIO_PIN_SET);    // RES 핀을 다시 HIGH로 올려서 리셋 해제
     HAL_Delay(120);                          // 120ms 대기 (리셋 후 안정화 시간, ST7789 데이터시트 권장값)
 }
-// LCD에 "이건 명령이다"라고 표시하며 1바이트를 전송하는 함수
+// LCD에 명령, 1바이트를 전송하는 함수
 void LCD_WriteCommand(uint8_t cmd)
 {
-    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_RESET);    // DC 핀을 LOW로 = "지금 보내는 건 명령이다"라는 신호
-    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET);    // CS 핀을 LOW로 = "지금부터 너(LCD)한테 말할게"라는 신호(칩 선택)
+    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_RESET);    // DC 핀을 LOW로 = "명령"이라는 신호
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET);    
     HAL_SPI_Transmit(&hspi1, &cmd, 1, HAL_MAX_DELAY);                    // SPI로 명령 1바이트 전송
-    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);      // CS 핀을 다시 HIGH로 = "전송 끝, 이제 너한테 말 안 해"
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);      
 }
-// LCD에 "이건 데이터다"라고 표시하며 1바이트를 전송하는 함수
+// LCD에 이건 데이터다라고 표시하며 1바이트를 전송하는 함수
 void LCD_WriteData(uint8_t data)
 {
-    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_SET);      // DC 핀을 HIGH로 = "지금 보내는 건 데이터다"라는 신호
+    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_SET);      // DC 핀을 HIGH로 = "데이터"라는 신호
     HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET);    // CS 핀을 LOW로 (칩 선택)
     HAL_SPI_Transmit(&hspi1, &data, 1, HAL_MAX_DELAY);                   // SPI로 데이터 1바이트 전송
     HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);      // CS 핀을 다시 HIGH로 (전송 끝)
@@ -1130,10 +1077,10 @@ void LCD_Init(void)
     HAL_Delay(150);                          // 150ms 대기 (리셋 완료 대기)
     LCD_WriteCommand(0x11);                  // Sleep Out (절전모드 해제)
     HAL_Delay(255);                          // 충분히 대기 (기존보다 늘림)
-    LCD_WriteCommand(0x3A);                  // Interface Pixel Format
+    LCD_WriteCommand(0x3A);                  
     LCD_WriteData(0x55);                     // 0x55 = 16비트 컬러(RGB565), 기존 0x05에서 값 수정
                                               // (0x55는 MCU 인터페이스/RGB 인터페이스 둘 다 16비트로 지정하는 표준값)
-    LCD_WriteCommand(0x36);                  // Memory Data Access Control
+    LCD_WriteCommand(0x36);                  
     LCD_WriteData(0x00);                     // 방향 기본값
     LCD_WriteCommand(0xB2);                  // Porch Setting (포치 타이밍 설정, 클론 패널에서 필요한 경우 많음)
     LCD_WriteData(0x0C);
@@ -1141,24 +1088,24 @@ void LCD_Init(void)
     LCD_WriteData(0x00);
     LCD_WriteData(0x33);
     LCD_WriteData(0x33);
-    LCD_WriteCommand(0xB7);                  // Gate Control
+    LCD_WriteCommand(0xB7);                  
     LCD_WriteData(0x35);
-    LCD_WriteCommand(0xBB);                  // VCOM Setting
+    LCD_WriteCommand(0xBB);                  
     LCD_WriteData(0x19);
-    LCD_WriteCommand(0xC0);                  // LCM Control
+    LCD_WriteCommand(0xC0);                  
     LCD_WriteData(0x2C);
-    LCD_WriteCommand(0xC2);                  // VDV and VRH Command Enable
+    LCD_WriteCommand(0xC2);                  
     LCD_WriteData(0x01);
-    LCD_WriteCommand(0xC3);                  // VRH Set
+    LCD_WriteCommand(0xC3);                  
     LCD_WriteData(0x12);
-    LCD_WriteCommand(0xC4);                  // VDV Set
+    LCD_WriteCommand(0xC4);                  
     LCD_WriteData(0x20);
-    LCD_WriteCommand(0xC6);                  // Frame Rate Control
+    LCD_WriteCommand(0xC6);                  
     LCD_WriteData(0x0F);
-    LCD_WriteCommand(0xD0);                  // Power Control 1
+    LCD_WriteCommand(0xD0);                  
     LCD_WriteData(0xA4);
     LCD_WriteData(0xA1);
-    LCD_WriteCommand(0xE0);                  // Positive Voltage Gamma Control
+    LCD_WriteCommand(0xE0);                  
     LCD_WriteData(0xD0);
     LCD_WriteData(0x04);
     LCD_WriteData(0x0D);
@@ -1173,7 +1120,7 @@ void LCD_Init(void)
     LCD_WriteData(0x0B);
     LCD_WriteData(0x1F);
     LCD_WriteData(0x23);
-    LCD_WriteCommand(0xE1);                  // Negative Voltage Gamma Control
+    LCD_WriteCommand(0xE1);                  
     LCD_WriteData(0xD0);
     LCD_WriteData(0x04);
     LCD_WriteData(0x0C);
@@ -1188,24 +1135,24 @@ void LCD_Init(void)
     LCD_WriteData(0x1F);
     LCD_WriteData(0x20);
     LCD_WriteData(0x23);
-    LCD_WriteCommand(0x21);                  // Display Inversion On (많은 ST7789 패널이 이거 켜야 색이 정상으로 보임)
+    LCD_WriteCommand(0x21);                  
     LCD_WriteCommand(0x29);                  // Display On
     HAL_Delay(50);
 }
 // 화면 전체를 지정된 색상(RGB565, 16비트)으로 채우는 함수
 void LCD_FillScreen(uint16_t color)
 {
-    LCD_WriteCommand(0x2A);                  // "Column Address Set" 명령 (가로 범위 설정 시작)
+    LCD_WriteCommand(0x2A);                  // 가로 범위 설정 시작
     LCD_WriteData(0x00);                     // 시작 컬럼 상위바이트
-    LCD_WriteData(0x00);                     // 시작 컬럼 하위바이트 (0부터 시작)
-    LCD_WriteData((LCD_WIDTH - 1) >> 8);     // 끝 컬럼 상위바이트 (239를 16비트로 나눈 상위 8비트)
+    LCD_WriteData(0x00);                     // 시작 컬럼 하위바이트 
+    LCD_WriteData((LCD_WIDTH - 1) >> 8);     // 끝 컬럼 상위바이트 
     LCD_WriteData((LCD_WIDTH - 1) & 0xFF);   // 끝 컬럼 하위바이트
-    LCD_WriteCommand(0x2B);                  // "Row Address Set" 명령 (세로 범위 설정 시작)
+    LCD_WriteCommand(0x2B);                  // 세로 범위 설정 시작
     LCD_WriteData(0x00);                     // 시작 로우 상위바이트
     LCD_WriteData(0x00);                     // 시작 로우 하위바이트
     LCD_WriteData((LCD_HEIGHT - 1) >> 8);    // 끝 로우 상위바이트
     LCD_WriteData((LCD_HEIGHT - 1) & 0xFF);  // 끝 로우 하위바이트
-    LCD_WriteCommand(0x2C);                  // "Memory Write" 명령 (지금부터 보내는 데이터는 화면 픽셀 값이라는 뜻)
+    LCD_WriteCommand(0x2C);                  // "Memory Write" 명령 (데이터 화면 픽셀 값이라는 뜻)
     HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_SET);   // DC를 HIGH로 (데이터 모드)
     HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET); // CS를 LOW로 (칩 선택, 이번엔 대량 전송이라 한 번만 선택)
     uint8_t color_bytes[2];                  // 색상값(16비트)을 2바이트로 나눠 담을 배열
@@ -1218,12 +1165,6 @@ void LCD_FillScreen(uint16_t color)
     HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);  // 다 끝났으면 CS를 다시 HIGH로 (전송 종료)
 }
 
-// ============================================================================
-// ===== ★추가: 간단한 3x5 비트맵 폰트로 글자/숫자 그리기 =====
-// 필요한 문자만 최소한으로 넣어둠: 숫자 0~9, '-' '.' ':' 공백, 그리고 D S W A R N O K M H
-// (표시할 문구가 "D:12.3M S:-4" "WARN"/"OK" 정도라서 이 문자들만 있으면 충분함)
-// 각 문자는 5행 x 3열 크기, rows[]의 각 바이트 하위 3비트가 그 행의 픽셀 패턴 (왼쪽부터 bit2,bit1,bit0)
-// ============================================================================
 typedef struct {
     char ch;             // 이 글리프가 어떤 문자를 나타내는지
     uint8_t rows[5];      // 5개 행의 비트패턴 (각 0~0b111)
@@ -1254,10 +1195,10 @@ static const FontGlyph FONT_TABLE[] = {
     {'K', {0b101,0b101,0b110,0b101,0b101}},
     {'M', {0b101,0b111,0b111,0b101,0b101}},
     {'H', {0b101,0b101,0b111,0b101,0b101}},
-    {'E', {0b111,0b100,0b111,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
-    {'C', {0b111,0b100,0b100,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
-    {'L', {0b100,0b100,0b100,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
-    {'B', {0b110,0b101,0b111,0b101,0b110}},  // ★추가: 폰트 테이블에 B가 아예 없어서 "B:1"이 빈칸으로 " :1"처럼 그려지던 진짜 원인 — B 비트맵 추가로 해결
+    {'E', {0b111,0b100,0b111,0b100,0b111}},  
+    {'C', {0b111,0b100,0b100,0b100,0b111}}, 
+    {'L', {0b100,0b100,0b100,0b100,0b111}},  
+    {'B', {0b110,0b101,0b111,0b101,0b110}},
 };
 #define FONT_TABLE_LEN (sizeof(FONT_TABLE) / sizeof(FONT_TABLE[0]))  // 폰트 테이블에 등록된 글리프 개수
 
@@ -1271,13 +1212,13 @@ static const uint8_t* FindGlyph(char c)
             return FONT_TABLE[i].rows;                   // 그 글리프의 비트패턴 5바이트를 반환
         }
     }
-    return NULL;                                       // 등록 안 된 문자면 NULL (공백처럼 그려짐)
+    return NULL;                                       
 }
 
-// 문자 하나를 (x,y) 위치(왼쪽위 기준)에 그리는 함수. size는 확대배율 (1이면 3x5픽셀, 4면 12x20픽셀)
+// 문자 하나를 (x,y) 위치(왼쪽위 기준)에 그리는 함수.확대배율
 void LCD_DrawChar(uint16_t x, uint16_t y, char c, uint16_t fg_color, uint16_t bg_color, uint8_t size)
 {
-    const uint8_t *glyph = FindGlyph(c);      // 이 문자의 비트패턴 찾기 (없으면 NULL=빈칸)
+    const uint8_t *glyph = FindGlyph(c);      
     uint16_t w = 3 * size;                    // 이 문자가 화면에서 차지할 가로 픽셀 수
     uint16_t h = 5 * size;                    // 이 문자가 화면에서 차지할 세로 픽셀 수
 
@@ -1293,18 +1234,18 @@ void LCD_DrawChar(uint16_t x, uint16_t y, char c, uint16_t fg_color, uint16_t bg
     LCD_WriteData((y + h - 1) & 0xFF);
     LCD_WriteCommand(0x2C);                   // Memory Write: 지금부터 픽셀 데이터 전송 시작
 
-    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_SET);    // DC HIGH = 데이터 모드
-    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET);  // CS LOW = 칩 선택 (문자 하나 다 그릴 때까지 유지)
+    HAL_GPIO_WritePin(LCD_DC_GPIO_Port, LCD_DC_Pin, GPIO_PIN_SET);    
+    HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_RESET);  
 
-    uint8_t fg_bytes[2] = { (uint8_t)(fg_color >> 8), (uint8_t)(fg_color & 0xFF) };  // 글자색 RGB565를 2바이트로
-    uint8_t bg_bytes[2] = { (uint8_t)(bg_color >> 8), (uint8_t)(bg_color & 0xFF) };  // 배경색 RGB565를 2바이트로
+    uint8_t fg_bytes[2] = { (uint8_t)(fg_color >> 8), (uint8_t)(fg_color & 0xFF) };  
+    uint8_t bg_bytes[2] = { (uint8_t)(bg_color >> 8), (uint8_t)(bg_color & 0xFF) };  
 
-    for (uint8_t row = 0; row < 5; row++)                    // 폰트의 5개 행을 위에서 아래로
+    for (uint8_t row = 0; row < 5; row++)                    
     {
         uint8_t bits = glyph ? glyph[row] : 0;                  // 이 행의 3비트 패턴 (glyph가 NULL이면 전부 꺼짐=공백)
         for (uint8_t ry = 0; ry < size; ry++)                   // 세로로 size배 확대해서 반복
         {
-            for (uint8_t col = 0; col < 3; col++)                 // 폰트의 3개 열을 왼쪽부터
+            for (uint8_t col = 0; col < 3; col++)                
             {
                 uint8_t on = (bits >> (2 - col)) & 0x01;            // 그 칸이 켜져있는지(1) 꺼져있는지(0)
                 for (uint8_t rx = 0; rx < size; rx++)                 // 가로로 size배 확대해서 반복
@@ -1321,7 +1262,7 @@ void LCD_DrawChar(uint16_t x, uint16_t y, char c, uint16_t fg_color, uint16_t bg
 void LCD_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t fg_color, uint16_t bg_color, uint8_t size)
 {
     uint16_t cursor_x = x;                        // 지금 그릴 위치(가로), 처음엔 시작 x좌표
-    while (*str)                                  // 문자열 끝(널문자)에 도달할 때까지 반복
+    while (*str)                                  // 문자열 끝에 도달할 때까지 반복
     {
         LCD_DrawChar(cursor_x, y, *str, fg_color, bg_color, size);  // 현재 위치에 문자 하나 그리기
         cursor_x += (3 * size) + size;               // 다음 문자 위치로 이동 (문자폭 + 글자사이 여백 1칸)
@@ -1329,30 +1270,24 @@ void LCD_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t fg_color, 
     }
 }
 
-// ★추가: 지금까지 계산된 거리/속도/경고상태를 화면에 표시하는 함수 (메인루프에서 300ms마다 호출됨)
+// 지금까지 계산된 거리/속도/경고상태를 화면에 표시하는 함수
 void LCD_UpdateStatus(void)
 {
     char line1[16];    // "D:123.4M" 같은 거리/속도 정보 한 줄
     char line2[8];     // "WARN" 또는 "OK  " 경고상태 한 줄
-    char line3[16];    // ★추가(디버그용): ELM327 연결여부 + 감속판정여부 + 제동등꺼짐판정(M) 표시
-    // ★변경: CAM 줄, 맨아래 하늘색 디버그 줄(T:)은 화면 정리를 위해 제거 — 대신 OK/WARN을 더 크게, 중앙에 표시
+    char line3[16];    // ELM327 연결여부 + 감속판정여부 + 제동등꺼짐판정(B) 표시
 
     if (radar_distance_m < 0)                                     // 아직 유효한 레이더 타겟이 없으면
     {
-        // ★변경(LCD 잔상 버그 fix): 기존엔 "D:---  S:----"(13자)를 써서, 정상 라인
-        // "D:%3d.%1dM S:%4d"(항상 고정 15자)보다 짧아 이전 프레임 숫자 잔상이 1~2칸 남는 문제가 있었음.
-        // → 정상 라인과 완전히 같은 자릿수 배치(15자, M/공백/S:/자리수 위치까지 동일)로 맞춰서
-        //   길이·위치 모두 일치시킴 → 어떤 경우에도 이전 픽셀이 안 남게 함
-        snprintf(line1, sizeof(line1), "D:---.-M S:----");           // 값 대신 "-"로 채우되 정상 라인과 자릿수 완전히 동일하게
+        snprintf(line1, sizeof(line1), "D:---.-M S:----");           // "-"로 채우되 자릿수는 정상 라인과 동일하게
     }
     else                                                          // 유효한 타겟이 있으면
     {
         int dist_int  = (int)radar_distance_m;                       // 거리의 정수부
-        int dist_frac = (int)((radar_distance_m - dist_int) * 10);   // 거리의 소수 첫째자리 (float printf 없이 직접 계산)
-        if (dist_frac < 0) dist_frac = -dist_frac;                   // 혹시 음수 반올림 오차 나오면 절대값 처리
-        int speed_int = (int)radar_speed_kmh;                        // 속도는 소수점 없이 정수로만 표시
+        int dist_frac = (int)((radar_distance_m - dist_int) * 10);   // 거리의 소수 첫째자리
+        if (dist_frac < 0) dist_frac = -dist_frac;                   // 음수 반올림 오차 나오면 절대값 처리
+        int speed_int = (int)radar_speed_kmh;                        // 속도는 정수로만 표시
         snprintf(line1, sizeof(line1), "D:%3d.%1dM S:%4d", dist_int, dist_frac, speed_int);
-        // %3d, %4d로 자리수를 고정해서, 이전에 더 길게 그렸던 숫자의 잔상이 안 남게 함
     }
 
     uint16_t warn_color;                                          // 경고 문구 색상 (상태에 따라 초록/빨강)
@@ -1363,15 +1298,12 @@ void LCD_UpdateStatus(void)
     }
     else                                                          // 정상 상태면
     {
-        snprintf(line2, sizeof(line2), "OK  ");                     // "OK"도 4글자로 맞춰서 잔상 방지
+        snprintf(line2, sizeof(line2), "OK  ");                     
         warn_color = 0x07E0;                                        // 초록 (RGB565)
     }
 
-    LCD_DrawString(10, 40, line1, 0xFFFF, 0x0000, 3);              // 거리/속도: 흰 글씨, 검정 배경, 3배 확대
+    LCD_DrawString(10, 40, line1, 0xFFFF, 0x0000, 3);              
 
-    // ★변경: OK/WARN을 더 크게(6배→8배), 가로 중앙 정렬해서 표시
-    // "OK  "/"WARN" 둘 다 4글자로 고정폭이라, 폭 계산이 항상 똑같이 나와서 매번 같은 x로 중앙정렬 가능
-    // (글자폭 공식: 문자 1개당 4*size픽셀 차지, 마지막 글자 뒤 여백 1*size는 안 빼고 그리므로 폭 = 4*size*글자수 - size)
     {
         uint8_t warn_size = 8;
         uint16_t text_w = 4 * warn_size * 4 - warn_size;           // 4글자 기준 폭 계산
@@ -1379,14 +1311,10 @@ void LCD_UpdateStatus(void)
         LCD_DrawString(warn_x, 90, line2, warn_color, 0x0000, warn_size);  // 경고문구: 상태색 글씨, 검정 배경, 8배 확대(크게), 가로 중앙
     }
 
-    // ★추가(디버그용): ELM327 응답 받은 적 있는지(E:C=연결됨/E:L=아직없음("Lost/없음"))
-    //                  + 지금 감속판정 상태(DECEL=감속중/------ =아니오)
-    //                  + ★변경: 제동등 상태 표시를 B(Brake light)로 이름 바꾸고, 값도 직관적으로 뒤집음
-    //                    B:1=제동등 켜짐(정상) / B:0=제동등 꺼짐(이상 후보) — "켜지면 1"이라 안 헷갈림
-    //                    (내부 판정 변수 dbg_brake_missing은 그대로 두고, 표시할 때만 반대로 뒤집어서 그림)
-    // (DECEL과 B가 "동시에" DECEL + B:0으로 뜨는지 눈으로 바로 확인 가능하게 — 그래야 이상판정 카운트가 진행됨)
+    // 3번째 줄: ELM327 연결여부(E:C=연결/E:L=없음), 감속판정(DECEL/-----), 제동등 상태(B:1=켜짐/B:0=꺼짐)
+    // (내부 판정 변수 dbg_brake_missing은 그대로 두고, 표시할 때만 뒤집어서 "켜지면 1"로 직관적으로 보이게 함)
     snprintf(line3, sizeof(line3), "E:%c %s B:%c", elm_data_valid ? 'C' : 'L', is_decelerating ? "DECEL" : "-----", dbg_brake_missing ? '0' : '1');
-    LCD_DrawString(10, 180, line3, 0xFFE0, 0x0000, 3);             // 노란 글씨, 검정 배경, 3배 확대 (CAM/T 줄 없앤 자리라 좀 더 키움)
+    LCD_DrawString(10, 180, line3, 0xFFE0, 0x0000, 3);             // 노란 글씨, 검정 배경, 3배 확대
 }
 /* USER CODE END 4 */
 

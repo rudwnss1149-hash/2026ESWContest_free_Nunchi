@@ -3,12 +3,8 @@
 # live_view_server.py
 # 이미 돌고 있는 taillight_detection_test.py(systemd 서비스)를 건드리지 않고,
 # 그 스크립트가 계속 갱신하고 있는 ~/latest_frame.jpg 파일을 웹페이지로 계속
-# 새로고침하며 보여주는 "가짜 실시간 스트리밍" 서버.
-#
-# (진짜 MJPEG 스트리밍은 아니고, 0.5초마다 이미지를 다시 불러오는 방식이라
-#  완전히 매끄러운 동영상은 아니지만, "지금 카메라가 뭘 보고 있는지" 확인하는
-#  용도로는 충분함. 외부 라이브러리(Flask 등) 설치 필요없이 파이썬 기본 기능만 씀)
-#
+# **개발 과정 참고용 라이브 뷰 서버 파일**
+
 # 사용법:
 #   1) python3 live_view_server.py   ← Pi 터미널(SSH)에서 실행
 #   2) VS Code로 Remote-SSH 연결돼있으면, 8080 포트가 자동으로 감지되면서
@@ -45,7 +41,7 @@ HTML_PAGE = """<!DOCTYPE html>
       img.src = '/frame.jpg?t=' + Date.now();   // 캐시 방지용으로 매번 다른 주소로 요청
       document.getElementById('ts').innerText = '마지막 갱신: ' + new Date().toLocaleTimeString();
     }
-    setInterval(refresh, 150);   // ★변경: 0.5초→0.15초 (taillight_detection_test.py의 SAVE_EVERY_N_FRAMES도 5→2로 같이 낮춤)
+    setInterval(refresh, 150);   
   </script>
 </body>
 </html>
@@ -53,7 +49,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # 매 요청마다 터미널에 로그 찍히는 거 방지 (안 그러면 로그가 너무 시끄러움)
+        pass  
 
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
