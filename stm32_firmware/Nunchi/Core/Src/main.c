@@ -147,6 +147,10 @@ volatile uint8_t cam_detected = 0;         // 0=미검출(또는 아직 한 번�
 // ★추가(디버그용): Pi<->STM32 통신이 실제로 되고 있는지 눈으로 확인하기 위한 카운터
 volatile uint32_t pi_total_lines = 0;      // USART2로 완성된 줄을 총 몇 개나 받았는지 (B, C, 뭐든 상관없이 다 셈)
 volatile uint32_t pi_cam_msgs = 0;         // 그중 "C," 파싱에 성공한 횟수
+// ★추가(디버그용): "DECEL은 뜨는데 부저가 안 울린다"는 현장 문의에 대응 — 두 판정조건이
+// 실제로 동시에 얼마나 겹치는지 LCD로 바로 확인하기 위한 변수들 (UpdateAnomalyJudgement에서 매 루프 갱신)
+volatile uint8_t dbg_brake_missing = 0;    // 이번 판정에서 "제동등 꺼짐"으로 본 게 맞는지 (0=정상/제동등 켜짐, 1=꺼짐으로 판정)
+volatile uint32_t dbg_anomaly_ms = 0;      // 지금 "감속+제동등꺼짐" 모순 상황이 몇 ms째 지속중인지 (0이면 지금은 모순 아님)
 // ===== 판정 로직(이상감지) 관련 =====
 #define SPEED_HISTORY_LEN 10                // 앞차 절대속도 이력을 몇 개까지 저장할지 (최근 몇 번의 측정값)
 typedef struct {                            // 속도 측정값 하나를 저장하는 구조체 (값+측정시각을 묶어서 관리)
@@ -1052,6 +1056,7 @@ void UpdateAnomalyJudgement(void)
         // pi_anomaly_flag가 0(정상, 즉 밝기변화 없음)이면 "제동등이 안 켜진 것"으로 해석
         // (pi_anomaly_flag=1이면 Pi가 이미 "밝아짐" 감지했다는 뜻이므로 이 경우는 문제 없음)
     }
+    dbg_brake_missing = brake_light_missing;  // ★추가(디버그용): 이번 판정 결과를 그대로 저장 (LCD 표시용)
     if (is_decelerating && brake_light_missing)  // 감속 중인데 + 제동등은 안 켜진 것으로 보이면 (모순 상황)
     {
         if (anomaly_start_tick == 0)          // 이 모순 상황이 방금 막 시작된 거라면 (아직 시작시각 기록 안 됨)
@@ -1081,6 +1086,9 @@ void UpdateAnomalyJudgement(void)
             anomaly_confirmed = 0;                // 이상 확정 상태도 해제
         }
     }
+    // ★추가(디버그용): 지금 "감속+제동등꺼짐" 모순이 몇 ms째 지속중인지 계산해서 LCD로 보여줄 수 있게 저장
+    // (anomaly_start_tick이 0이면 지금은 모순 상황이 아니라는 뜻이므로 0으로 표시)
+    dbg_anomaly_ms = (anomaly_start_tick != 0) ? (HAL_GetTick() - anomaly_start_tick) : 0;
     if (anomaly_confirmed)                    // 최종적으로 이상이 확정된 상태면
     {
         HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // 부저를 계속 울림 (경고음)
@@ -1249,6 +1257,7 @@ static const FontGlyph FONT_TABLE[] = {
     {'E', {0b111,0b100,0b111,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
     {'C', {0b111,0b100,0b100,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
     {'L', {0b100,0b100,0b100,0b100,0b111}},  // ★추가(디버그용 3번째 줄에 필요)
+    {'B', {0b110,0b101,0b111,0b101,0b110}},  // ★추가: 폰트 테이블에 B가 아예 없어서 "B:1"이 빈칸으로 " :1"처럼 그려지던 진짜 원인 — B 비트맵 추가로 해결
 };
 #define FONT_TABLE_LEN (sizeof(FONT_TABLE) / sizeof(FONT_TABLE[0]))  // 폰트 테이블에 등록된 글리프 개수
 
@@ -1325,9 +1334,8 @@ void LCD_UpdateStatus(void)
 {
     char line1[16];    // "D:123.4M" 같은 거리/속도 정보 한 줄
     char line2[8];     // "WARN" 또는 "OK  " 경고상태 한 줄
-    char line3[16];    // ★추가(디버그용): ELM327 연결여부 + 감속판정여부 표시
-    char line4[16];    // ★추가: 지금 이 순간 카메라가 차량을 검출하고 있는지 실시간 표시
-    char line5[24];    // ★추가(디버그용): Pi<->STM32 통신 카운터 (총 수신 줄 수 / C, 파싱 성공 수)
+    char line3[16];    // ★추가(디버그용): ELM327 연결여부 + 감속판정여부 + 제동등꺼짐판정(M) 표시
+    // ★변경: CAM 줄, 맨아래 하늘색 디버그 줄(T:)은 화면 정리를 위해 제거 — 대신 OK/WARN을 더 크게, 중앙에 표시
 
     if (radar_distance_m < 0)                                     // 아직 유효한 레이더 타겟이 없으면
     {
@@ -1360,22 +1368,25 @@ void LCD_UpdateStatus(void)
     }
 
     LCD_DrawString(10, 40, line1, 0xFFFF, 0x0000, 3);              // 거리/속도: 흰 글씨, 검정 배경, 3배 확대
-    LCD_DrawString(10, 100, line2, warn_color, 0x0000, 6);         // 경고문구: 상태색 글씨, 검정 배경, 6배 확대(크게)
+
+    // ★변경: OK/WARN을 더 크게(6배→8배), 가로 중앙 정렬해서 표시
+    // "OK  "/"WARN" 둘 다 4글자로 고정폭이라, 폭 계산이 항상 똑같이 나와서 매번 같은 x로 중앙정렬 가능
+    // (글자폭 공식: 문자 1개당 4*size픽셀 차지, 마지막 글자 뒤 여백 1*size는 안 빼고 그리므로 폭 = 4*size*글자수 - size)
+    {
+        uint8_t warn_size = 8;
+        uint16_t text_w = 4 * warn_size * 4 - warn_size;           // 4글자 기준 폭 계산
+        uint16_t warn_x = (240 - text_w) / 2;                        // 240 = LCD 가로 해상도, 화면 중앙에 오도록 x 계산
+        LCD_DrawString(warn_x, 90, line2, warn_color, 0x0000, warn_size);  // 경고문구: 상태색 글씨, 검정 배경, 8배 확대(크게), 가로 중앙
+    }
 
     // ★추가(디버그용): ELM327 응답 받은 적 있는지(E:C=연결됨/E:L=아직없음("Lost/없음"))
-    //                  + 지금 감속판정 상태(DECEL=감속중/------ =아니오) 를 작게 표시
-    snprintf(line3, sizeof(line3), "E:%c %s", elm_data_valid ? 'C' : 'L', is_decelerating ? "DECEL" : "-----");
-    LCD_DrawString(10, 160, line3, 0xFFE0, 0x0000, 2);             // 노란 글씨, 검정 배경, 2배 확대(작게, 디버그용이니 방해 안 되게)
-
-    // ★추가: 지금 이 순간 카메라(Pi/YOLO)가 차량을 검출하고 있는지 실시간 표시
-    // (CAM:D = 검출됨, CAM:- = 미검출 — Pi가 매 프레임 "C," 메시지로 계속 갱신해줌)
-    snprintf(line4, sizeof(line4), "CAM:%c", cam_detected ? 'D' : '-');
-    uint16_t cam_color = cam_detected ? 0x07E0 : 0xF800;           // 검출되면 초록, 미검출이면 빨강
-    LCD_DrawString(10, 190, line4, cam_color, 0x0000, 2);
-
-    // ★추가(디버그용): Pi<->STM32 통신이 실제로 되고 있는지 확인용 카운터 (원인 파악 끝나면 나중에 지워도 됨)
-    snprintf(line5, sizeof(line5), "L:%lu C:%lu", (unsigned long)pi_total_lines, (unsigned long)pi_cam_msgs);
-    LCD_DrawString(10, 215, line5, 0x07FF, 0x0000, 2);              // 하늘색 글씨
+    //                  + 지금 감속판정 상태(DECEL=감속중/------ =아니오)
+    //                  + ★변경: 제동등 상태 표시를 B(Brake light)로 이름 바꾸고, 값도 직관적으로 뒤집음
+    //                    B:1=제동등 켜짐(정상) / B:0=제동등 꺼짐(이상 후보) — "켜지면 1"이라 안 헷갈림
+    //                    (내부 판정 변수 dbg_brake_missing은 그대로 두고, 표시할 때만 반대로 뒤집어서 그림)
+    // (DECEL과 B가 "동시에" DECEL + B:0으로 뜨는지 눈으로 바로 확인 가능하게 — 그래야 이상판정 카운트가 진행됨)
+    snprintf(line3, sizeof(line3), "E:%c %s B:%c", elm_data_valid ? 'C' : 'L', is_decelerating ? "DECEL" : "-----", dbg_brake_missing ? '0' : '1');
+    LCD_DrawString(10, 180, line3, 0xFFE0, 0x0000, 3);             // 노란 글씨, 검정 배경, 3배 확대 (CAM/T 줄 없앤 자리라 좀 더 키움)
 }
 /* USER CODE END 4 */
 
