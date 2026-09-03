@@ -1,0 +1,14 @@
+[Unit]
+Description=Nunchi taillight anomaly detection
+After=network.target
+
+[Service]
+Type=simple
+User=jun
+WorkingDirectory=/home/jun/pi_vision/src
+ExecStart=/usr/bin/python3 /home/jun/pi_vision/src/taillight_detection_test.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
